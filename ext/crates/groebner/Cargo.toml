@@ -1,0 +1,21 @@
+[package]
+name = "groebner"
+version = "0.1.0"
+edition = "2024"
+description = "Minimal resolutions over Steenrod algebras via Gröbner bases (after W. Lin)"
+
+[dependencies]
+algebra = { path = "../algebra", default-features = false }
+fp = { path = "../fp", default-features = false }
+maybe-rayon = { path = "../maybe-rayon" }
+
+rustc-hash = "2.1.1"
+tracing = "0.1.41"
+
+[dev-dependencies]
+rstest = "0.25.0"
+
+[features]
+default = ["odd-primes"]
+concurrent = ["algebra/concurrent", "fp/concurrent", "maybe-rayon/concurrent"]
+odd-primes = ["algebra/odd-primes", "fp/odd-primes"]

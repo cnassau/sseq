@@ -180,6 +180,7 @@ use algebra::module::SteenrodModule;
 use crate::chain_complex::FiniteChainComplex;
 pub type CCC = FiniteChainComplex<SteenrodModule>;
 
+pub mod groebner;
 pub mod nassau;
 pub mod secondary;
 pub mod utils;

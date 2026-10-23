@@ -16,16 +16,21 @@ use crate::{
     save::SaveDirectory,
 };
 
-// We build docs with --all-features so the docs are at the feature = "nassau" version
-#[cfg(not(feature = "nassau"))]
+// We build docs with --all-features so the docs are at the feature = "groebner" version
+#[cfg(not(any(feature = "nassau", feature = "groebner")))]
 pub type QueryModuleResolution = Resolution<CCC>;
 
 /// The type returned by [`query_module`]. The value of this type depends on whether
 /// [`nassau`](crate::nassau) is enabled. In any case, it is an augmented free chain complex over
 /// either [`SteenrodAlgebra`] or [`MilnorAlgebra`] and supports the `compute_through_stem`
 /// function.
-#[cfg(feature = "nassau")]
+#[cfg(all(feature = "nassau", not(feature = "groebner")))]
 pub type QueryModuleResolution = crate::nassau::Resolution<FDModule<MilnorAlgebra>>;
+
+/// The type returned by [`query_module`] when the `groebner` feature is enabled, which takes
+/// precedence over `nassau`.
+#[cfg(feature = "groebner")]
+pub type QueryModuleResolution = crate::groebner::Resolution<FDModule<MilnorAlgebra>>;
 
 const STATIC_MODULES_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../ext/steenrod_modules");
 
@@ -158,15 +163,78 @@ where
     anyhow::Error: From<E>,
     T: TryInto<Config, Error = E>,
 {
-    #[cfg(feature = "nassau")]
+    #[cfg(feature = "groebner")]
+    {
+        let _ = save_dir;
+        let kind = match std::env::var("GROEBNER_KIND").as_deref() {
+            Ok("motivic") => Some(algebra::SteenrodKind::MotivicModTau),
+            Ok("reduced") => Some(algebra::SteenrodKind::ReducedPowers),
+            Ok("classical") | Err(_) => None,
+            Ok(other) => return Err(anyhow!("unknown GROEBNER_KIND {other}")),
+        };
+        construct_groebner(module_spec, kind)
+    }
+
+    #[cfg(all(feature = "nassau", not(feature = "groebner")))]
     {
         construct_nassau(module_spec, save_dir)
     }
 
-    #[cfg(not(feature = "nassau"))]
+    #[cfg(not(any(feature = "nassau", feature = "groebner")))]
     {
         construct_standard(module_spec, save_dir)
     }
+}
+
+/// See [`construct`]. The algebra is the classical Steenrod algebra unless `kind` says otherwise.
+///
+/// With the `groebner` feature, [`construct`] reads `kind` from the environment variable
+/// `GROEBNER_KIND`, which is one of `classical`, `motivic` and `reduced`.
+pub fn construct_groebner<T, E>(
+    module_spec: T,
+    kind: Option<algebra::SteenrodKind>,
+) -> anyhow::Result<crate::groebner::Resolution<FDModule<MilnorAlgebra>>>
+where
+    anyhow::Error: From<E>,
+    T: TryInto<Config, Error = E>,
+{
+    use algebra::{SteenrodKind, milnor_algebra::MilnorProfile};
+
+    let Config {
+        module: json,
+        algebra,
+    } = module_spec.try_into()?;
+
+    let spec = algebra::AlgebraSpec::from_json(&json)?;
+    if spec.basis(algebra)? == AlgebraType::Adem {
+        return Err(anyhow!("Gröbner resolutions require Milnor's basis"));
+    }
+    if spec.profile.is_some() {
+        return Err(anyhow!("Gröbner resolutions do not support profiles"));
+    }
+    if json["type"].as_str() != Some("finite dimensional module") {
+        return Err(anyhow!(
+            "Gröbner resolutions only support finite dimensional modules"
+        ));
+    }
+    if !json["cofiber"].is_null() {
+        return Err(anyhow!("Gröbner resolutions do not support cofibers"));
+    }
+
+    let p = spec.p;
+    let algebra = match kind.unwrap_or(SteenrodKind::Classical) {
+        SteenrodKind::Classical => MilnorAlgebra::new(p, false),
+        SteenrodKind::MotivicModTau if p == 2 => {
+            MilnorAlgebra::motivic_mod_tau(MilnorProfile::default(), false)
+        }
+        SteenrodKind::ReducedPowers if p != 2 => {
+            MilnorAlgebra::reduced_powers(p, MilnorProfile::default(), false)
+        }
+        kind => return Err(anyhow!("{kind} does not exist at p = {p}")),
+    };
+    let algebra = Arc::new(algebra);
+    let module = Arc::new(FDModule::from_json(Arc::clone(&algebra), &json)?);
+    crate::groebner::Resolution::new(module)
 }
 
 /// See [`construct`]
@@ -412,15 +480,16 @@ pub fn query_module_only(
 
     let load_quasi_inverse = load_quasi_inverse && resolution.save_dir().is_none();
 
-    #[cfg(not(feature = "nassau"))]
+    #[cfg(not(any(feature = "nassau", feature = "groebner")))]
     {
         resolution.load_quasi_inverse = load_quasi_inverse;
     }
 
-    #[cfg(feature = "nassau")]
+    #[cfg(any(feature = "nassau", feature = "groebner"))]
     assert!(
         !load_quasi_inverse,
-        "Quasi inverse loading not support with Nassau. Please use a save directory instead"
+        "Quasi inverse loading is only supported by the standard resolution. Please use a save \
+         directory instead"
     );
 
     resolution.set_name(name);
@@ -505,7 +574,13 @@ pub fn get_unit(
             bivec::BiVec::from_vec(0, vec![1]),
         );
 
-        #[cfg(feature = "nassau")]
+        #[cfg(feature = "groebner")]
+        {
+            let _ = save_dir;
+            Arc::new(crate::groebner::Resolution::new(Arc::new(module))?)
+        }
+
+        #[cfg(all(feature = "nassau", not(feature = "groebner")))]
         {
             Arc::new(crate::nassau::Resolution::new_with_save(
                 Arc::new(module),
@@ -513,7 +588,7 @@ pub fn get_unit(
             )?)
         }
 
-        #[cfg(not(feature = "nassau"))]
+        #[cfg(not(any(feature = "nassau", feature = "groebner")))]
         {
             let cc = FiniteChainComplex::ccdz(Arc::new(steenrod_module::erase(module)));
             Arc::new(Resolution::new_with_save(Arc::new(cc), save_dir)?)

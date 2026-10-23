@@ -16,6 +16,7 @@ resolver = "2"
 algebra = { path = "crates/algebra", default-features = false }
 bivec = { path = "crates/bivec" }
 fp = { path = "crates/fp", default-features = false }
+groebner = { path = "crates/groebner", default-features = false }
 maybe-rayon = { path = "crates/maybe-rayon" }
 once = { path = "crates/once" }
 query = { path = "crates/query" }
@@ -52,13 +53,22 @@ cache-multiplication = ["algebra/cache-multiplication"]
 concurrent = [
     "algebra/concurrent",
     "fp/concurrent",
+    "groebner/concurrent",
     "maybe-rayon/concurrent",
     "once/concurrent",
     "sseq/concurrent",
 ]
-odd-primes = ["fp/odd-primes", "algebra/odd-primes", "sseq/odd-primes"]
+odd-primes = [
+    "fp/odd-primes",
+    "algebra/odd-primes",
+    "groebner/odd-primes",
+    "sseq/odd-primes",
+]
 logging = []
 nassau = []
+# Resolve with Lin's Gröbner basis algorithm. This implies `nassau`, which the examples read as
+# "resolutions are over `MilnorAlgebra`", and takes precedence over it.
+groebner = ["nassau"]
 # Dispatch large p=2 matrix products to the Hopper GPU backend via `fp`.
 gpu = ["fp/gpu"]
 
@@ -67,6 +77,7 @@ members = [
     "crates/algebra",
     "crates/bivec",
     "crates/fp",
+    "crates/groebner",
     "crates/maybe-rayon",
     "crates/once",
     "crates/query",

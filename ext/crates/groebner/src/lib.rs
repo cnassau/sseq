@@ -18,8 +18,8 @@ pub use filter::{
 };
 pub use level::{GbElement, Level};
 pub use monomial::{ModMono, Mono};
-pub use pairs::{Pair, PairCounts};
+pub use pairs::{Pair, PairCounts, SINGLE};
 pub use params::{Params, Position};
-pub use poly::Poly;
+pub use poly::{MAX_PRIME, Poly};
 pub use resolution::{Bounds, Generator, Resolution};
 pub use stats::{Outcome, PairEvent, PairLog, PairObserver, Stats, StepStats};

@@ -1,26 +1,6 @@
 //! The Milnor product formula on packed monomials.
 
-use std::{cell::RefCell, sync::atomic::Ordering};
-
-use rustc_hash::FxHashMap;
-
 use crate::{Mono, Params};
-
-/// A product cache that grows beyond this many terms is cleared, trading recomputation for
-/// memory.
-const CACHE_TERMS_LIMIT: usize = 1 << 18;
-
-/// Products already computed by this thread, valid for one [`Params`] and one cache epoch.
-#[derive(Default)]
-struct ProductCache {
-    owner: (u64, u64),
-    ranges: FxHashMap<(Mono, Mono), (u32, u32)>,
-    terms: Vec<(Mono, u32)>,
-}
-
-thread_local! {
-    static CACHE: RefCell<ProductCache> = RefCell::new(ProductCache::default());
-}
 
 /// The longest sequence $R$ in $P(R)$, which bounds the index $n$ of $\xi_n$.
 pub(crate) const MAX_LEN: usize = 16;
@@ -50,11 +30,21 @@ impl Params {
     /// The exterior part and the sequence $R$ of `m`.
     pub(crate) fn decode_seq(&self, m: Mono) -> (u32, Seq) {
         let mut r = Seq::default();
-        for (idx, d) in self.digits(m) {
-            let pos = &self.positions()[idx];
-            let n = pos.xi as usize;
-            r.len = r.len.max(n);
-            r.entries[n - 1] += d * self.prime().pow(pos.exp);
+        if let Some(bits) = self.bit_positions() {
+            let mut rest = m.digits();
+            while rest != 0 {
+                let (n, value) = bits[rest.trailing_zeros() as usize];
+                rest &= rest - 1;
+                r.entries[n as usize] += value;
+                r.len = r.len.max(n as usize + 1);
+            }
+        } else {
+            for (idx, d) in self.digits(m) {
+                let pos = &self.positions()[idx];
+                let n = pos.xi as usize;
+                r.len = r.len.max(n);
+                r.entries[n - 1] += d * pos.value;
+            }
         }
         (m.q_part(), r)
     }
@@ -80,55 +70,6 @@ impl Params {
                 f(self.encode_product(e, t), c0 * c % self.prime())
             });
         }
-    }
-
-    /// Like [`mul`](Self::mul), but each monomial is reported once, and the result is cached
-    /// until the next call to [`clear_product_cache`](Self::clear_product_cache).
-    ///
-    /// The resolution clears the cache in every internal degree, which bounds its size by the
-    /// products of a single degree, where the same products recur across many reductions.
-    pub fn mul_cached(&self, a: Mono, b: Mono, mut f: impl FnMut(Mono, u32)) {
-        CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let owner = (self.id(), self.cache_epoch.load(Ordering::Relaxed));
-            if cache.owner != owner || cache.terms.len() > CACHE_TERMS_LIMIT {
-                cache.owner = owner;
-                cache.ranges.clear();
-                cache.terms.clear();
-            }
-            let ProductCache { ranges, terms, .. } = &mut *cache;
-            let (start, end) = *ranges.entry((a, b)).or_insert_with(|| {
-                let start = terms.len();
-                self.mul(a, b, |m, c| terms.push((m, c)));
-                let new = &mut terms[start..];
-                new.sort_unstable_by_key(|&(m, _)| m);
-                let mut len = 0;
-                for i in 0..new.len() {
-                    if len > 0 && new[len - 1].0 == new[i].0 {
-                        new[len - 1].1 = (new[len - 1].1 + new[i].1) % self.prime();
-                    } else {
-                        if len > 0 && new[len - 1].1 == 0 {
-                            len -= 1;
-                        }
-                        new[len] = new[i];
-                        len += 1;
-                    }
-                }
-                if len > 0 && new[len - 1].1 == 0 {
-                    len -= 1;
-                }
-                terms.truncate(start + len);
-                (start as u32, terms.len() as u32)
-            });
-            for &(m, c) in &terms[start as usize..end as usize] {
-                f(m, c);
-            }
-        })
-    }
-
-    /// Invalidate the products cached by [`mul_cached`](Self::mul_cached) on every thread.
-    pub fn clear_product_cache(&self) {
-        self.cache_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The monomial $Q(E) P(T)$ of a product, which is representable whenever the factors are of

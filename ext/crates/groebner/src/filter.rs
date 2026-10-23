@@ -29,7 +29,7 @@ impl PairContext<'_> {
     /// there.
     pub fn lcm(&self) -> Option<Mono> {
         self.lead1
-            .map(|l1| self.params.lcm(l1.mono, self.lead2.mono))
+            .map(|l1| self.params.lcm(l1.mono(), self.lead2.mono()))
     }
 
     /// The degree of the pair above its generator, which is the degree of the algebra elements
@@ -45,8 +45,8 @@ impl PairContext<'_> {
     /// into the Steenrod algebra the pair reaches.
     pub fn depth(&self) -> u32 {
         let monos = [
-            self.lead1.map(|l| l.mono),
-            Some(self.lead2.mono),
+            self.lead1.map(|l| l.mono()),
+            Some(self.lead2.mono()),
             Some(self.pair.m1),
             Some(self.pair.m2),
         ];

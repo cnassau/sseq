@@ -1,13 +1,19 @@
 //! Packed Milnor basis elements and module monomials.
 
-/// The bit offset of the May weight.
-pub const WEIGHT_SHIFT: u32 = 112;
-/// The bit offset of the exterior part.
-pub const Q_SHIFT: u32 = 96;
-/// The number of $Q_k$ a monomial can hold.
-pub const Q_BITS: u32 = 16;
 /// The number of bits holding the digits of the polynomial part.
-pub const DIGIT_BITS: u32 = 96;
+pub const DIGIT_BITS: u32 = 80;
+/// The bit offset of the exterior part.
+pub const Q_SHIFT: u32 = DIGIT_BITS;
+/// The number of $Q_k$ a monomial can hold.
+pub const Q_BITS: u32 = 14;
+/// The bit offset of the May weight.
+pub const WEIGHT_SHIFT: u32 = Q_SHIFT + Q_BITS;
+/// The number of bits of the May weight, which is at most the degree.
+pub const WEIGHT_BITS: u32 = 14;
+/// The bit offset of the generator in a [`ModMono`].
+pub const GENERATOR_SHIFT: u32 = WEIGHT_SHIFT + WEIGHT_BITS;
+/// The number of bits of the generator in a [`ModMono`].
+pub const GENERATOR_BITS: u32 = u128::BITS - GENERATOR_SHIFT;
 
 /// A Milnor basis element $Q(E) P(R)$, packed so that integer comparison is the monomial order.
 ///
@@ -32,12 +38,12 @@ impl Mono {
 
     /// Convert an exterior part with $Q_k$ in bit `k` to its packed form.
     pub fn q_part_to_raw(q_part: u32) -> u128 {
-        ((q_part as u16).reverse_bits() as u128) << Q_SHIFT
+        (((q_part as u16).reverse_bits() >> (u16::BITS - Q_BITS)) as u128) << Q_SHIFT
     }
 
     /// The exterior part with $Q_k$ in bit `k`.
     pub fn q_part(self) -> u32 {
-        (self.q_raw() as u16).reverse_bits() as u32
+        ((self.q_raw() as u16).reverse_bits() >> (u16::BITS - Q_BITS)) as u32
     }
 
     /// The indices $k$ of the $Q_k$ in this monomial, in increasing order.
@@ -53,7 +59,7 @@ impl Mono {
 
     /// The May weight.
     pub fn weight(self) -> u32 {
-        (self.0 >> WEIGHT_SHIFT) as u32
+        ((self.0 >> WEIGHT_SHIFT) as u32) & ((1 << WEIGHT_BITS) - 1)
     }
 
     /// The digit fields.
@@ -67,36 +73,38 @@ impl Mono {
     }
 }
 
-/// A monomial $m \cdot g$ of a free module, where `gen` indexes the generator $g$.
+/// A monomial $m \cdot g$ of a free module, packed into one word with the complement of the index
+/// of $g$ above the [`Mono`].
 ///
-/// Larger generators come first, then monomials are compared as [`Mono`]s. The leading term of a
-/// module element is its smallest term.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ModMono {
-    /// The index of the generator.
-    pub generator: u32,
-    /// The algebra part.
-    pub mono: Mono,
-}
+/// Integer comparison puts larger generators first, then compares the monomials. The leading term
+/// of a module element is its smallest term.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ModMono(u128);
 
 impl ModMono {
-    /// The monomial `mono * generator`.
+    /// The bits of the generator.
+    const GENERATOR_MASK: u32 = ((1u64 << GENERATOR_BITS) - 1) as u32;
+
+    /// The monomial `mono * g`, where `generator` is the index of `g`.
     pub fn new(generator: u32, mono: Mono) -> Self {
-        Self { generator, mono }
+        debug_assert!(generator <= Self::GENERATOR_MASK, "too many generators");
+        debug_assert!(mono.0 >> GENERATOR_SHIFT == 0);
+        Self((((!generator & Self::GENERATOR_MASK) as u128) << GENERATOR_SHIFT) | mono.0)
+    }
+
+    /// The index of the generator.
+    pub fn generator(self) -> u32 {
+        !((self.0 >> GENERATOR_SHIFT) as u32) & Self::GENERATOR_MASK
+    }
+
+    /// The algebra part.
+    pub fn mono(self) -> Mono {
+        Mono(self.0 & ((1 << GENERATOR_SHIFT) - 1))
     }
 }
 
-impl Ord for ModMono {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other
-            .generator
-            .cmp(&self.generator)
-            .then(self.mono.cmp(&other.mono))
-    }
-}
-
-impl PartialOrd for ModMono {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+impl std::fmt::Debug for ModMono {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} g{}", self.mono(), self.generator())
     }
 }

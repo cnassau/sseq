@@ -1,16 +1,23 @@
 //! Sparse elements of free modules over the Steenrod algebra.
 
-use std::{cmp::Reverse, collections::BinaryHeap, rc::Rc};
+use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc};
 
 use crate::{ModMono, Mono, Params};
 
 /// An element of a free module, as terms sorted in increasing order with non-zero coefficients.
 ///
+/// The monomials and the coefficients are kept apart, so that a term takes 17 bytes rather than
+/// the 32 of an aligned pair. Coefficients are residues mod a prime of at most [`MAX_PRIME`].
+///
 /// The leading term is the first one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Poly {
-    terms: Vec<(ModMono, u32)>,
+    monos: Vec<ModMono>,
+    coeffs: Vec<u8>,
 }
+
+/// The largest prime whose residues fit the coefficients of a [`Poly`].
+pub const MAX_PRIME: u32 = u8::MAX as u32;
 
 impl Poly {
     /// The zero element.
@@ -21,72 +28,105 @@ impl Poly {
     /// The element `c * m`.
     pub fn monomial(m: ModMono, c: u32) -> Self {
         Self {
-            terms: vec![(m, c)],
+            monos: vec![m],
+            coeffs: vec![c as u8],
+        }
+    }
+
+    /// An empty element with room for `n` terms.
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            monos: Vec::with_capacity(n),
+            coeffs: Vec::with_capacity(n),
+        }
+    }
+
+    /// Append a term larger than all others, if its coefficient is non-zero.
+    fn push(&mut self, m: ModMono, c: u32) {
+        debug_assert!(self.monos.last().is_none_or(|&l| l < m));
+        if c != 0 {
+            self.monos.push(m);
+            self.coeffs.push(c as u8);
         }
     }
 
     /// The sum of the given terms, which may be unsorted and repeat monomials.
     pub fn from_terms(mut terms: Vec<(ModMono, u32)>, p: u32) -> Self {
         terms.sort_unstable_by_key(|&(m, _)| m);
-        let mut out: Vec<(ModMono, u32)> = Vec::with_capacity(terms.len());
+        let mut out = Self::with_capacity(terms.len());
+        let mut pending: Option<(ModMono, u32)> = None;
         for (m, c) in terms {
-            match out.last_mut() {
+            match &mut pending {
                 Some((last, d)) if *last == m => *d = (*d + c) % p,
                 _ => {
-                    if let Some((_, 0)) = out.last() {
-                        out.pop();
+                    if let Some((last, d)) = pending {
+                        out.push(last, d);
                     }
-                    out.push((m, c % p));
+                    pending = Some((m, c % p));
                 }
             }
         }
-        if let Some((_, 0)) = out.last() {
-            out.pop();
+        if let Some((last, d)) = pending {
+            out.push(last, d);
         }
-        Self { terms: out }
+        out.monos.shrink_to_fit();
+        out.coeffs.shrink_to_fit();
+        out
     }
 
     /// The element with the given terms, which must be sorted, distinct and non-zero.
-    pub fn from_sorted_terms(terms: Vec<(ModMono, u32)>) -> Self {
-        debug_assert!(terms.is_sorted_by(|a, b| a.0 < b.0));
-        debug_assert!(terms.iter().all(|&(_, c)| c != 0));
-        Self { terms }
+    pub fn from_sorted_terms(terms: impl IntoIterator<Item = (ModMono, u32)>) -> Self {
+        let mut out = Self::zero();
+        for (m, c) in terms {
+            debug_assert!(c != 0);
+            out.push(m, c);
+        }
+        out
     }
 
     /// The terms in increasing order.
-    pub fn terms(&self) -> &[(ModMono, u32)] {
-        &self.terms
+    pub fn terms(&self) -> impl ExactSizeIterator<Item = (ModMono, u32)> + '_ {
+        self.monos
+            .iter()
+            .zip(&self.coeffs)
+            .map(|(&m, &c)| (m, c as u32))
+    }
+
+    /// The term in position `i`.
+    pub fn term(&self, i: usize) -> (ModMono, u32) {
+        (self.monos[i], self.coeffs[i] as u32)
     }
 
     /// The number of terms.
     pub fn num_terms(&self) -> usize {
-        self.terms.len()
+        self.monos.len()
     }
 
     /// Whether this is zero.
     pub fn is_zero(&self) -> bool {
-        self.terms.is_empty()
+        self.monos.is_empty()
     }
 
     /// The leading term.
     pub fn lead(&self) -> Option<(ModMono, u32)> {
-        self.terms.first().copied()
+        (!self.is_zero()).then(|| self.term(0))
     }
 
     /// The coefficient of `m`.
     pub fn coefficient(&self, m: ModMono) -> u32 {
-        self.terms
-            .binary_search_by(|&(x, _)| x.cmp(&m))
-            .map_or(0, |i| self.terms[i].1)
+        self.monos
+            .binary_search(&m)
+            .map_or(0, |i| self.coeffs[i] as u32)
     }
 
     /// Multiply by the scalar `c`.
     pub fn scale(&mut self, c: u32, p: u32) {
         if c.is_multiple_of(p) {
-            self.terms.clear();
+            *self = Self::zero();
+            return;
         }
-        for (_, d) in &mut self.terms {
-            *d = *d * c % p;
+        for d in &mut self.coeffs {
+            *d = (*d as u32 * c % p) as u8;
         }
     }
 
@@ -95,40 +135,36 @@ impl Poly {
         if c.is_multiple_of(p) || other.is_zero() {
             return;
         }
-        let mut out = Vec::with_capacity(self.terms.len() + other.terms.len());
-        let (mut a, mut b) = (self.terms.iter().peekable(), other.terms.iter().peekable());
-        loop {
-            match (a.peek(), b.peek()) {
-                (Some(&&(ma, ca)), Some(&&(mb, cb))) => match ma.cmp(&mb) {
-                    std::cmp::Ordering::Less => {
-                        out.push((ma, ca));
-                        a.next();
-                    }
-                    std::cmp::Ordering::Greater => {
-                        out.push((mb, cb * c % p));
-                        b.next();
-                    }
-                    std::cmp::Ordering::Equal => {
-                        let s = (ca + cb * c) % p;
-                        if s != 0 {
-                            out.push((ma, s));
-                        }
-                        a.next();
-                        b.next();
-                    }
-                },
-                (Some(&&t), None) => {
-                    out.push(t);
-                    a.next();
+        let mut out = Self::with_capacity(self.num_terms() + other.num_terms());
+        let (mut i, mut j) = (0, 0);
+        while i < self.num_terms() && j < other.num_terms() {
+            let (ma, ca) = self.term(i);
+            let (mb, cb) = other.term(j);
+            match ma.cmp(&mb) {
+                std::cmp::Ordering::Less => {
+                    out.push(ma, ca);
+                    i += 1;
                 }
-                (None, Some(&&(mb, cb))) => {
-                    out.push((mb, cb * c % p));
-                    b.next();
+                std::cmp::Ordering::Greater => {
+                    out.push(mb, cb * c % p);
+                    j += 1;
                 }
-                (None, None) => break,
+                std::cmp::Ordering::Equal => {
+                    out.push(ma, (ca + cb * c) % p);
+                    i += 1;
+                    j += 1;
+                }
             }
         }
-        self.terms = out;
+        for k in i..self.num_terms() {
+            let (m, d) = self.term(k);
+            out.push(m, d);
+        }
+        for k in j..other.num_terms() {
+            let (m, d) = other.term(k);
+            out.push(m, d * c % p);
+        }
+        *self = out;
     }
 }
 
@@ -139,18 +175,18 @@ impl Poly {
 /// makes reduction cheap: the element being reduced is never copied.
 #[derive(Default)]
 pub struct Merger {
-    sources: Vec<(Rc<Poly>, u32, usize)>,
+    sources: Vec<(Arc<Poly>, u32, usize)>,
     heap: BinaryHeap<Reverse<(ModMono, u32)>>,
 }
 
 impl Merger {
     /// Add `factor` times the terms of `poly` from position `start` on.
-    pub fn add(&mut self, poly: Rc<Poly>, factor: u32, start: usize) {
+    pub fn add(&mut self, poly: Arc<Poly>, factor: u32, start: usize) {
         if factor == 0 || start >= poly.num_terms() {
             return;
         }
         let idx = self.sources.len() as u32;
-        self.heap.push(Reverse((poly.terms[start].0, idx)));
+        self.heap.push(Reverse((poly.monos[start], idx)));
         self.sources.push((poly, factor, start));
     }
 
@@ -158,9 +194,9 @@ impl Merger {
     /// reduced mod p.
     fn advance(&mut self, idx: u32) -> u32 {
         let (poly, factor, pos) = &mut self.sources[idx as usize];
-        let c = poly.terms[*pos].1 * *factor;
+        let c = poly.coeffs[*pos] as u32 * *factor;
         *pos += 1;
-        if let Some(&(m, _)) = poly.terms.get(*pos) {
+        if let Some(&m) = poly.monos.get(*pos) {
             self.heap.push(Reverse((m, idx)));
         }
         c
@@ -186,11 +222,11 @@ impl Merger {
 
     /// The sum of everything not read yet.
     pub fn finish(mut self, p: u32) -> Poly {
-        let mut terms = Vec::new();
-        while let Some(t) = self.next_term(p) {
-            terms.push(t);
+        let mut out = Poly::zero();
+        while let Some((m, c)) = self.next_term(p) {
+            out.push(m, c);
         }
-        Poly { terms }
+        out
     }
 }
 
@@ -199,10 +235,10 @@ impl Params {
     pub fn mul_poly(&self, m: Mono, c: u32, x: &Poly) -> Poly {
         let p = self.prime();
         let mut terms = Vec::with_capacity(x.num_terms());
-        for &(t, d) in x.terms() {
+        for (t, d) in x.terms() {
             let cd = c * d % p;
-            self.mul_cached(m, t.mono, |prod, e| {
-                terms.push((ModMono::new(t.generator, prod), cd * e % p))
+            self.mul(m, t.mono(), |prod, e| {
+                terms.push((ModMono::new(t.generator(), prod), cd * e % p))
             });
         }
         Poly::from_terms(terms, p)
@@ -214,12 +250,12 @@ impl Params {
         let p = self.prime();
         let wm = self.may_filtration(m);
         let mut terms = Vec::with_capacity(x.num_terms());
-        for &(t, d) in x.terms() {
+        for (t, d) in x.terms() {
             let cd = c * d % p;
-            let w = wm + self.may_filtration(t.mono);
-            self.mul_cached(m, t.mono, |prod, e| {
+            let w = wm + self.may_filtration(t.mono());
+            self.mul(m, t.mono(), |prod, e| {
                 if self.may_filtration(prod) == w {
-                    terms.push((ModMono::new(t.generator, prod), cd * e % p));
+                    terms.push((ModMono::new(t.generator(), prod), cd * e % p));
                 }
             });
         }
@@ -233,19 +269,18 @@ impl Params {
         }
         let terms: Vec<String> = x
             .terms()
-            .iter()
-            .map(|&(m, c)| {
+            .map(|(m, c)| {
                 let coef = if c == 1 {
                     String::new()
                 } else {
                     format!("{c} ")
                 };
-                let mono = if m.mono.is_one() {
+                let mono = if m.mono().is_one() {
                     String::new()
                 } else {
-                    format!("{} ", self.format(m.mono))
+                    format!("{} ", self.format(m.mono()))
                 };
-                format!("{coef}{mono}{}", name(m.generator))
+                format!("{coef}{mono}{}", name(m.generator()))
             })
             .collect();
         terms.join(" + ")

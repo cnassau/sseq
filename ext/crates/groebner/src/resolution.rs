@@ -1,13 +1,19 @@
 //! The minimal resolution, computed one internal degree at a time.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use maybe_rayon::prelude::*;
 
 use crate::{
     ModMono, Mono, Params, Poly,
     filter::{FilterCounts, FilterMode, FilterReport, InstalledFilter, PairContext, PairFilter},
-    level::{GbElement, Level, X2mTrack, filtration},
+    level::{CacheRef, GbElement, Level, ProductCache, X2mTrack, filtration},
     pairs::Pair,
     stats::{Outcome, PairEvent, PairObserver, Stats},
 };
@@ -29,6 +35,10 @@ pub struct Bounds {
     /// The largest stem $t - s$.
     pub n_max: i32,
 }
+
+/// The number of pairs reduced by one task. Larger tasks cost less scheduling, smaller ones
+/// balance the load between threads better, which matters because single reductions can be long.
+const PAIRS_PER_TASK: usize = 1;
 
 /// The index standing for x2m pruning among the predictions of a pair.
 const X2M_FILTER: u16 = u16::MAX;
@@ -64,18 +74,18 @@ impl X2m {
     /// Add a relation with leading coefficient one to the basis of level `s`.
     fn push(&mut self, params: &Params, s: usize, rel: GbElement) {
         let lead = rel.x1.lead().unwrap().0;
-        let degree = self.degrees[s][lead.generator as usize];
+        let degree = self.degrees[s][lead.generator() as usize];
         self.levels[s].push(params, rel, degree);
     }
 
     /// Reduce the critical pairs of degree `t` of the relations of level `s`, and add the results
     /// to the basis.
-    fn complete_basis(&mut self, params: &Params, s: usize, t: i32) {
+    fn complete_basis(&mut self, params: &Params, cache: CacheRef, s: usize, t: i32) {
         let (pairs, _) = self.levels[s].take_pairs(params, t);
         let mut new: Vec<GbElement> = Vec::new();
         for pair in pairs {
             let mut e = self.levels[s].pair_element(params, &pair, false);
-            self.levels[s].reduce(params, &mut e.x1, None, None);
+            self.levels[s].reduce(params, cache, &mut e.x1, None, None);
             Level::triangulate(params, &mut e.x1, None, &new);
             if !e.x1.is_zero() {
                 e.normalize(params);
@@ -93,6 +103,7 @@ impl X2m {
     fn predict(
         &mut self,
         params: &Params,
+        cache: CacheRef,
         level: &Level,
         s: usize,
         mut pairs: Vec<(Option<Pair>, Vec<u16>)>,
@@ -104,7 +115,7 @@ impl X2m {
         let mut kept = Vec::with_capacity(pairs.len());
         for (pair, mut predicted) in pairs {
             let mut x = level.pair_x2m(params, pair.as_ref().unwrap());
-            self.levels[s].reduce(params, &mut x, None, None);
+            self.levels[s].reduce(params, cache, &mut x, None, None);
             Level::triangulate(params, &mut x, None, &seen);
             if let Some((_, c)) = x.lead() {
                 x.scale(params.inverse(c), p);
@@ -177,7 +188,7 @@ impl Resolution {
             let Some((lead, _)) = rel.lead() else {
                 continue;
             };
-            let t = params.degree(lead.mono) + generator_degrees[lead.generator as usize];
+            let t = params.degree(lead.mono()) + generator_degrees[lead.generator() as usize];
             by_degree.entry(t).or_default().push(rel);
         }
         let mut generators = vec![Vec::new(); bounds.s_max as usize + 1];
@@ -373,7 +384,7 @@ impl Resolution {
             pair,
             lead1: (!pair.is_single()).then(|| leads[pair.i1 as usize]),
             lead2,
-            generator: generators[s][lead2.generator as usize],
+            generator: generators[s][lead2.generator() as usize],
         }
     }
 
@@ -381,10 +392,16 @@ impl Resolution {
     fn step(&mut self, t: i32) {
         let _span = tracing::info_span!("groebner_step", t).entered();
         let params = Arc::clone(&self.params);
-        params.clear_product_cache();
         let p = params.prime();
         let num_levels = self.levels.len();
         let track = self.x2m.is_some();
+        // One cache of products per level, and one per x2m basis.
+        let caches: Vec<ProductCache> = (0..2 * num_levels).map(|_| Default::default()).collect();
+        let cached_terms = AtomicUsize::new(0);
+        let cache = |i: usize| CacheRef {
+            cache: &caches[i],
+            total: &cached_terms,
+        };
 
         // `work[s + 1]` are the pairs of level `s`, or the relations for `s = -1`, each with the
         // audited filters that predict it to be useless.
@@ -400,7 +417,7 @@ impl Resolution {
                 continue;
             }
             if let Some(x2m) = &mut self.x2m {
-                x2m.complete_basis(&params, s, t);
+                x2m.complete_basis(&params, cache(num_levels + s), s, t);
             }
             let (pairs, counts) = self.levels[s].take_pairs(&params, t);
             self.stats.get_mut(s as i32, t).pairs = counts;
@@ -427,7 +444,7 @@ impl Resolution {
                 }
             }
             if let Some(x2m) = &mut self.x2m {
-                kept = x2m.predict(&params, &self.levels[s], s, kept);
+                kept = x2m.predict(&params, cache(num_levels + s), &self.levels[s], s, kept);
             }
             // A prediction is right if the pair adds nothing to the others, so reduce the pairs
             // under audit last. This changes which pairs become elements, but not their leading
@@ -439,36 +456,80 @@ impl Resolution {
             return;
         }
 
-        // Each level is reduced by one task, so that the products cached while reducing one pair
-        // are at hand for the others.
         let levels = &self.levels;
         let x2m_levels = self.x2m.as_ref().map(|x| &x.levels);
-        let mut by_level: Vec<Vec<Reduced>> = work
-            .into_maybe_par_iter()
+        let tasks: Vec<(i32, usize, Vec<(Option<Pair>, Vec<u16>)>)> = work
+            .into_iter()
             .enumerate()
-            .map(|(level_idx, pairs)| {
+            .flat_map(|(level_idx, pairs)| {
                 let s = level_idx as i32 - 1;
-                pairs
+                let mut pairs = pairs.into_iter().peekable();
+                let mut start = 0;
+                std::iter::from_fn(move || {
+                    pairs.peek()?;
+                    let chunk: Vec<_> = pairs.by_ref().take(PAIRS_PER_TASK).collect();
+                    start += chunk.len();
+                    Some((s, start - chunk.len(), chunk))
+                })
+            })
+            .collect();
+        // The caches of level `s` serve the tasks of levels `s` and `s - 1`, and that of the x2m
+        // basis of level `s` those of level `s`. Each is dropped once its last task is done.
+        let users: Vec<AtomicUsize> = (0..2 * num_levels).map(|_| AtomicUsize::new(0)).collect();
+        let users_of = |s: i32| {
+            let s1 = (s + 1) as usize;
+            [
+                (s >= 0).then_some(s as usize),
+                (s1 < num_levels).then_some(s1),
+                (s >= 0 && track).then(|| num_levels + s as usize),
+            ]
+            .into_iter()
+            .flatten()
+        };
+        for &(s, _, _) in &tasks {
+            for i in users_of(s) {
+                users[i].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let reduced: Vec<Vec<Reduced>> = tasks
+            .into_maybe_par_iter()
+            .map(|(s, start, pairs)| {
+                let reduced = pairs
                     .into_iter()
                     .enumerate()
                     .map(|(idx, (pair, predicted))| {
                         let (mut element, mut steps) = match pair {
-                            None => (GbElement::new(Poly::zero(), relations[idx].clone()), 0),
+                            None => (
+                                GbElement::new(Poly::zero(), relations[start + idx].clone()),
+                                0,
+                            ),
                             Some(pair) => {
                                 let level = &levels[s as usize];
                                 let mut e = level.pair_element(&params, &pair, track);
                                 let GbElement { x1, x2, x2m, fil } = &mut e;
                                 let track = track.then_some(X2mTrack { x2m, fil: *fil });
-                                let mut steps = level.reduce(&params, x1, Some(x2), track);
+                                let mut steps =
+                                    level.reduce(&params, cache(s as usize), x1, Some(x2), track);
                                 if let Some(x2m_levels) = x2m_levels {
-                                    steps += x2m_levels[s as usize]
-                                        .reduce(&params, &mut e.x2m, None, None);
+                                    steps += x2m_levels[s as usize].reduce(
+                                        &params,
+                                        cache(num_levels + s as usize),
+                                        &mut e.x2m,
+                                        None,
+                                        None,
+                                    );
                                 }
                                 (e, steps)
                             }
                         };
                         if let Some(next) = levels.get((s + 1) as usize) {
-                            steps += next.reduce(&params, &mut element.x2, None, None);
+                            steps += next.reduce(
+                                &params,
+                                cache((s + 1) as usize),
+                                &mut element.x2,
+                                None,
+                                None,
+                            );
                         }
                         Reduced {
                             s,
@@ -478,9 +539,19 @@ impl Resolution {
                             steps,
                         }
                     })
-                    .collect()
+                    .collect();
+                for i in users_of(s) {
+                    if users[i].fetch_sub(1, Ordering::AcqRel) == 1 {
+                        caches[i].clear(&cached_terms);
+                    }
+                }
+                reduced
             })
             .collect();
+        let mut by_level: Vec<Vec<Reduced>> = (0..=num_levels).map(|_| Vec::new()).collect();
+        for r in reduced.into_iter().flatten() {
+            by_level[(r.s + 1) as usize].push(r);
+        }
 
         let mut new: Vec<Vec<GbElement>> = vec![Vec::new(); num_levels];
         // New relations among the x2m generators of each level.
@@ -535,8 +606,8 @@ impl Resolution {
                 }
                 r.element.x2.scale(params.inverse(c), p);
                 let cycle = r.element.x2.clone();
-                let ext_degree = lead.mono.ext_degree()
-                    + self.generators[s2 - 1][lead.generator as usize].ext_degree;
+                let ext_degree = lead.mono().ext_degree()
+                    + self.generators[s2 - 1][lead.generator() as usize].ext_degree;
                 let index = self.generators[s2].len() as u32;
                 self.generators[s2].push(Generator {
                     degree: t,
@@ -619,7 +690,7 @@ impl Resolution {
                 });
                 let ext_degree = context.map_or(0, |ctx| {
                     ctx.pair.m2.ext_degree()
-                        + ctx.lead2.mono.ext_degree()
+                        + ctx.lead2.mono().ext_degree()
                         + ctx.generator.ext_degree
                 });
                 let predicted_by: Vec<&str> = r
@@ -648,7 +719,7 @@ impl Resolution {
         for (s, elements) in new.into_iter().enumerate() {
             for e in elements {
                 let lead = e.x1.lead().unwrap().0;
-                let degree = self.generators[s][lead.generator as usize].degree;
+                let degree = self.generators[s][lead.generator() as usize].degree;
                 self.levels[s].push(&params, e, degree);
             }
         }

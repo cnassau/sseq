@@ -15,8 +15,9 @@ No linear algebra is involved: everything is rewriting of sparse module elements
 ## How it works
 
 Every module element is a sparse sum of monomials $Q(E) P(R) g$, where $g$ is a generator. A
-monomial is packed into a `u128` (`Mono`): from the top down, the May weight, the exterior part
-and the $p$-adic digits $d_{i,n}$ of $R$, one field per $\xi_n^{p^i}$, ordered by degree. Integer
+monomial is packed into a `u128` (`ModMono`): from the top down, the complement of the index of
+$g$, the May weight, the exterior part and the $p$-adic digits $d_{i,n}$ of $R$, one field per
+$\xi_n^{p^i}$, ordered by degree. Coefficients are kept in a separate array of bytes. Integer
 comparison is the monomial order, and the leading term of a sum is its smallest term. With this
 order the leading term of a product is the product of the leading terms in the associated graded
 algebra
@@ -34,7 +35,9 @@ by the $C_s$ component. In each internal degree $t$:
    pairs are pruned by the Gebauer–Möller criteria when they are formed.
 2. Installed filters, and Lin's x2m criterion if enabled, may discard pairs or mark them for
    auditing.
-3. Each pair is reduced, levels in parallel.
+3. Each pair is reduced, in parallel. The products $u \cdot g$ of basis elements by monomials
+   that the reductions need recur across pairs, so each is computed once per degree and shared
+   between threads, until the pairs that can use it are done.
 4. Going down from the top level, a result whose $C_s$ component survives is a new basis element.
    Otherwise its $C_{s+1}$ component is a cycle: it is either a boundary or the differential of a
    new generator of $C_{s+2}$.

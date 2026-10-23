@@ -1,12 +1,14 @@
 //! One homological level of the resolution: a Gröbner basis of the graph of a differential.
 
 use std::{
-    cell::RefCell,
-    rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
+    hash::{BuildHasher, Hash},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::{
     ModMono, Mono, Params, Poly,
@@ -20,7 +22,7 @@ pub type Filtration = (u32, u32);
 
 /// The [`Filtration`] of `m`.
 pub fn filtration(params: &Params, m: ModMono) -> Filtration {
-    (!m.generator, params.may_filtration(m.mono))
+    (!m.generator(), params.may_filtration(m.mono()))
 }
 
 /// An element $(x_1, x_2)$ of $C_s \oplus C_{s+1}$ with $d x_2 = x_1$.
@@ -82,10 +84,6 @@ impl GbElement {
     }
 }
 
-/// A product cache that grows beyond this many terms is cleared, trading recomputation for
-/// memory.
-const CACHE_TERMS_LIMIT: usize = 1 << 20;
-
 /// Which component of a [`GbElement`] a cached product is of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Component {
@@ -102,22 +100,85 @@ pub struct X2mTrack<'a> {
     pub fil: Filtration,
 }
 
-/// Products $u \cdot g$ of basis elements by monomials already computed by this thread, valid
-/// for one [`Params`] and one cache epoch.
+/// The [`ProductCache`]s of one degree stop storing products once they hold this many terms in
+/// all. Products beyond it are computed again by every reduction that needs them, which trades
+/// time for memory.
+pub const CACHE_TERMS_BUDGET: usize = 1 << 23;
+
+/// The number of independently locked parts of a [`ProductCache`]. More shards mean less
+/// contention between threads, at the cost of a little memory.
+const CACHE_SHARDS: usize = 16;
+
+/// A key of a [`ProductCache`]: the element, the monomial and the component.
+type ProductKey = (u32, Mono, Component);
+
+/// The products $u \cdot g$ of the basis elements of one level by monomials that the reductions
+/// of one internal degree need, shared between threads.
 ///
-/// Elements of a level never change once pushed, so a product stays correct as long as the
-/// level exists. The cache is cleared with the product cache of `Params`, i.e. in every internal
-/// degree, since a product only serves to reduce terms of its own degree.
-#[derive(Default)]
-struct ElementProductCache {
-    owner: (u64, u64),
-    products: FxHashMap<(u64, u32, Mono, Component), Rc<Poly>>,
-    terms: usize,
+/// The same products recur across the reductions of a degree, and only there, since a product
+/// serves to cancel a term of its own degree. Each product is computed once, by whichever thread
+/// asks first; others asking meanwhile wait for it.
+pub struct ProductCache {
+    shards: Vec<Mutex<FxHashMap<ProductKey, Arc<OnceLock<Arc<Poly>>>>>>,
+    terms: AtomicUsize,
 }
 
-thread_local! {
-    static ELEMENT_PRODUCTS: RefCell<ElementProductCache> =
-        RefCell::new(ElementProductCache::default());
+impl Default for ProductCache {
+    fn default() -> Self {
+        Self {
+            shards: (0..CACHE_SHARDS).map(|_| Mutex::default()).collect(),
+            terms: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ProductCache {
+    /// The product with the given key, computed by `compute` if it is not known yet. Nothing new
+    /// is stored once `total`, the number of terms stored by all caches of the degree, reaches
+    /// [`CACHE_TERMS_BUDGET`].
+    fn get(
+        &self,
+        key: ProductKey,
+        total: &AtomicUsize,
+        compute: impl FnOnce() -> Poly,
+    ) -> Arc<Poly> {
+        let shard = FxBuildHasher.hash_one(key) as usize % CACHE_SHARDS;
+        let cell = {
+            let mut shard = self.shards[shard].lock().unwrap();
+            match shard.get(&key) {
+                Some(cell) => Arc::clone(cell),
+                None if total.load(Ordering::Relaxed) >= CACHE_TERMS_BUDGET => {
+                    drop(shard);
+                    return Arc::new(compute());
+                }
+                None => Arc::clone(shard.entry(key).or_default()),
+            }
+        };
+        Arc::clone(cell.get_or_init(|| {
+            let prod = compute();
+            self.terms.fetch_add(prod.num_terms(), Ordering::Relaxed);
+            total.fetch_add(prod.num_terms(), Ordering::Relaxed);
+            Arc::new(prod)
+        }))
+    }
+
+    /// Drop everything, giving the terms back to `total`.
+    pub fn clear(&self, total: &AtomicUsize) {
+        for shard in &self.shards {
+            *shard.lock().unwrap() = FxHashMap::default();
+        }
+        total.fetch_sub(self.terms.swap(0, Ordering::Relaxed), Ordering::Relaxed);
+    }
+}
+
+/// The cache of products of a [`Level`], and the budget it shares with the caches of the other
+/// levels.
+#[derive(Clone, Copy)]
+pub struct CacheRef<'a> {
+    /// The cache.
+    pub cache: &'a ProductCache,
+    /// The number of terms stored by all caches of the degree.
+    pub total: &'a AtomicUsize,
 }
 
 /// A Gröbner basis of the graph of $d \colon C_{s+1} \to C_s$, ordered by the $C_s$ component.
@@ -129,8 +190,6 @@ thread_local! {
 /// products keep the terms of the right May filtration.
 #[derive(Debug)]
 pub struct Level {
-    /// Distinguishes levels in the thread-local product caches.
-    id: u64,
     /// Whether products are taken in the associated graded algebra of the May filtration.
     may: bool,
     elements: Vec<GbElement>,
@@ -152,9 +211,7 @@ impl Level {
 
     /// An empty level with products in the associated graded algebra if `may` is set.
     fn with_products(t_trunc: i32, may: bool) -> Self {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         Self {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             may,
             elements: Vec::new(),
             leads: Vec::new(),
@@ -201,7 +258,7 @@ impl Level {
         self.pairs
             .add_lead(params, &self.leads, lead, generator_degree);
         self.by_generator
-            .entry(lead.generator)
+            .entry(lead.generator())
             .or_default()
             .push(self.elements.len() as u32);
         self.leads.push(lead);
@@ -216,10 +273,10 @@ impl Level {
     /// The index of an element whose leading term divides `m`.
     pub fn find_divisor(&self, params: &Params, m: ModMono) -> Option<usize> {
         self.by_generator
-            .get(&m.generator)?
+            .get(&m.generator())?
             .iter()
             .map(|&k| k as usize)
-            .find(|&k| params.divides(self.leads[k].mono, m.mono))
+            .find(|&k| params.divides(self.leads[k].mono(), m.mono()))
     }
 
     /// The product `m * x`, in the associated graded algebra for an x2m basis.
@@ -270,8 +327,8 @@ impl Level {
             return x;
         }
         let g1 = &self.elements[pair.i1 as usize];
-        let ca = params.lf_coefficient(pair.m1, self.leads[pair.i1 as usize].mono);
-        let cb = params.lf_coefficient(pair.m2, self.leads[pair.i2 as usize].mono);
+        let ca = params.lf_coefficient(pair.m1, self.leads[pair.i1 as usize].mono());
+        let cb = params.lf_coefficient(pair.m2, self.leads[pair.i2 as usize].mono());
         x.scale(ca, p);
         x.add_scaled(&params.mul_may_poly(pair.m1, 1, &g1.x2m), params.neg(cb), p);
         x
@@ -284,28 +341,21 @@ impl Level {
     }
 
     /// The product of the monomial `u` with a component of element `k`.
-    fn product(&self, params: &Params, k: usize, u: Mono, component: Component) -> Rc<Poly> {
-        ELEMENT_PRODUCTS.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let owner = (params.id(), params.cache_epoch());
-            if cache.owner != owner || cache.terms > CACHE_TERMS_LIMIT {
-                cache.owner = owner;
-                cache.products.clear();
-                cache.terms = 0;
-            }
-            let key = (self.id, k as u32, u, component);
-            if let Some(prod) = cache.products.get(&key) {
-                return Rc::clone(prod);
-            }
+    fn product(
+        &self,
+        params: &Params,
+        cache: CacheRef,
+        k: usize,
+        u: Mono,
+        component: Component,
+    ) -> Arc<Poly> {
+        cache.cache.get((k as u32, u, component), cache.total, || {
             let g = &self.elements[k];
-            let prod = Rc::new(match component {
+            match component {
                 Component::X1 => self.mul(params, u, &g.x1),
                 Component::X2 => self.mul(params, u, &g.x2),
                 Component::X2m => params.mul_may_poly(u, 1, &g.x2m),
-            });
-            cache.terms += prod.num_terms();
-            cache.products.insert(key, Rc::clone(&prod));
-            prod
+            }
         })
     }
 
@@ -318,15 +368,16 @@ impl Level {
     pub fn reduce(
         &self,
         params: &Params,
+        cache: CacheRef,
         x: &mut Poly,
         companion: Option<&mut Poly>,
         track: Option<X2mTrack>,
     ) -> u64 {
         let p = params.prime();
         let mut merger = Merger::default();
-        merger.add(Rc::new(std::mem::take(x)), 1, 0);
-        let mut companions: Vec<(u32, Rc<Poly>)> = Vec::new();
-        let mut x2ms: Vec<(u32, Rc<Poly>)> = Vec::new();
+        merger.add(Arc::new(std::mem::take(x)), 1, 0);
+        let mut companions: Vec<(u32, Arc<Poly>)> = Vec::new();
+        let mut x2ms: Vec<(u32, Arc<Poly>)> = Vec::new();
         let mut out: Vec<(ModMono, u32)> = Vec::new();
         let mut steps = 0;
         while let Some((m, c)) = merger.next_term(p) {
@@ -335,8 +386,8 @@ impl Level {
                 continue;
             };
             steps += 1;
-            let u = params.quotient(m.mono, self.leads[k].mono);
-            let prod = self.product(params, k, u, Component::X1);
+            let u = params.quotient(m.mono(), self.leads[k].mono());
+            let prod = self.product(params, cache, k, u, Component::X1);
             let (lead, lambda) = prod.lead().unwrap();
             debug_assert_eq!(lead, m);
             let factor = params.neg(c * params.inverse(lambda) % p);
@@ -345,22 +396,22 @@ impl Level {
                 if filtration(params, current_lead) == track.fil
                     && filtration(params, m) == track.fil
                 {
-                    x2ms.push((factor, self.product(params, k, u, Component::X2m)));
+                    x2ms.push((factor, self.product(params, cache, k, u, Component::X2m)));
                 }
             }
             // The leading term of the product cancels `m`.
             merger.add(prod, factor, 1);
             if companion.is_some() {
-                companions.push((factor, self.product(params, k, u, Component::X2)));
+                companions.push((factor, self.product(params, cache, k, u, Component::X2)));
             }
         }
         *x = Poly::from_sorted_terms(out);
-        let merge_into = |target: &mut Poly, parts: Vec<(u32, Rc<Poly>)>| {
+        let merge_into = |target: &mut Poly, parts: Vec<(u32, Arc<Poly>)>| {
             if parts.is_empty() {
                 return;
             }
             let mut merger = Merger::default();
-            merger.add(Rc::new(std::mem::take(target)), 1, 0);
+            merger.add(Arc::new(std::mem::take(target)), 1, 0);
             for (factor, prod) in parts {
                 merger.add(prod, factor, 0);
             }

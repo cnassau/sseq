@@ -1,10 +1,8 @@
 //! The Steenrod algebra a Gröbner resolution works over, and the layout of its packed monomials.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use algebra::SteenrodKind;
 
-use crate::monomial::{DIGIT_BITS, Mono, Q_BITS, WEIGHT_SHIFT};
+use crate::monomial::{DIGIT_BITS, Mono, Q_BITS, WEIGHT_BITS, WEIGHT_SHIFT};
 
 /// Degrees of positions are capped here so that sums of degrees stay well inside an `i32`.
 const DEGREE_CAP: i64 = 1 << 24;
@@ -25,6 +23,8 @@ pub struct Position {
     pub weight: u32,
     /// The bit offset of the least significant bit of the digit field.
     pub shift: u32,
+    /// $p^i$, the contribution of one unit of this digit to $r_n$.
+    pub value: u32,
 }
 
 /// The prime, kind and monomial encoding of a Steenrod algebra.
@@ -37,9 +37,6 @@ pub struct Position {
 /// is non-zero.
 #[derive(Debug)]
 pub struct Params {
-    /// Distinguishes instances in the thread-local product caches.
-    id: u64,
-    pub(crate) cache_epoch: AtomicU64,
     p: u32,
     kind: SteenrodKind,
     has_exterior: bool,
@@ -60,6 +57,11 @@ pub struct Params {
     inverses: Vec<u32>,
     factorials: Vec<u32>,
     inverse_factorials: Vec<u32>,
+    /// `encodings[n - 1][r]` is $P(0, \dots, 0, r)$ with $r$ in position $n$, for every $r$ whose
+    /// degree is at most `max_degree`. Encodings of different $n$ add up to that of $P(R)$.
+    encodings: Vec<Vec<u128>>,
+    /// At `p = 2`, the position index and value of the digit at each bit.
+    bit_positions: Vec<(u8, u32)>,
 }
 
 impl Params {
@@ -72,6 +74,10 @@ impl Params {
         assert!(
             p >= 2 && (2..p).all(|d| !p.is_multiple_of(d)),
             "{p} is not a prime"
+        );
+        assert!(
+            p <= crate::poly::MAX_PRIME,
+            "coefficients mod {p} do not fit a Poly"
         );
         let (has_exterior, q) = match kind {
             SteenrodKind::Classical if p == 2 => (false, 1),
@@ -116,6 +122,7 @@ impl Params {
                     degree: degree as i32,
                     weight: 2 * xi - 1,
                     shift: DIGIT_BITS - (idx as u32 + 1) * width,
+                    value: p.pow(exp),
                 });
                 if position_of.len() < xi as usize {
                     position_of.resize(xi as usize, Vec::new());
@@ -126,6 +133,8 @@ impl Params {
             }
         }
 
+        // The weight of a monomial is at most its degree.
+        max_degree = max_degree.min((1 << WEIGHT_BITS) - 1);
         assert!(
             position_of.len() <= crate::product::MAX_LEN,
             "positions exceed the supported length of Milnor sequences"
@@ -167,10 +176,7 @@ impl Params {
             inverse_factorials[a as usize] = inverses[factorials[a as usize] as usize];
         }
 
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        Self {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            cache_epoch: AtomicU64::new(0),
+        let mut params = Self {
             p,
             kind,
             has_exterior,
@@ -186,17 +192,40 @@ impl Params {
             inverses,
             factorials,
             inverse_factorials,
+            encodings: Vec::new(),
+            bit_positions: Vec::new(),
+        };
+        params.encodings = (1..=params.position_of.len() as u32)
+            .map(|n| {
+                let degree = params.positions[params.position_of[n as usize - 1][0]].degree;
+                (0..=(params.max_degree / degree) as u32)
+                    .map(|r| params.encode_slow(n, r).0)
+                    .collect()
+            })
+            .collect();
+        if p == 2 {
+            params.bit_positions = vec![(0, 0); DIGIT_BITS as usize];
+            for pos in &params.positions {
+                params.bit_positions[pos.shift as usize] = ((pos.xi - 1) as u8, pos.value);
+            }
         }
+        params
     }
 
-    /// A number identifying this instance among all instances created by the process.
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    /// Advanced by [`clear_product_cache`](Self::clear_product_cache).
-    pub fn cache_epoch(&self) -> u64 {
-        self.cache_epoch.load(Ordering::Relaxed)
+    /// The monomial $P(0, \dots, 0, r)$ with $r$ in position $n$, digit by digit.
+    fn encode_slow(&self, n: u32, r: u32) -> Mono {
+        let mut digits = Vec::new();
+        let mut rest = r;
+        let mut exp = 0;
+        while rest > 0 {
+            let d = rest % self.p;
+            if d != 0 {
+                digits.push((self.position_of(n, exp).unwrap(), d));
+            }
+            rest /= self.p;
+            exp += 1;
+        }
+        self.from_digits(0, digits)
     }
 
     /// The prime.
@@ -327,32 +356,26 @@ impl Params {
         if q_part >= 1 << Q_BITS {
             return None;
         }
-        let p = self.p;
-        let mut raw = Mono::q_part_to_raw(q_part);
-        let mut weight: u32 = if q_part == 0 {
-            0
-        } else {
-            (0..Q_BITS)
+        let mut raw = 0;
+        if q_part != 0 {
+            let weight: u32 = (0..Q_BITS)
                 .filter(|k| q_part & (1 << k) != 0)
                 .map(Self::tau_weight)
-                .sum()
-        };
+                .sum();
+            raw = Mono::q_part_to_raw(q_part) | ((weight as u128) << WEIGHT_SHIFT);
+        }
         for (n, &rn) in r.iter().enumerate() {
-            let row = self.position_of.get(n)?;
-            let mut rn = rn;
-            let mut exp = 0;
-            while rn > 0 {
-                let d = rn % p;
-                if d != 0 {
-                    let pos = &self.positions[*row.get(exp)?];
-                    raw |= (d as u128) << pos.shift;
-                    weight += d * pos.weight;
-                }
-                rn /= p;
-                exp += 1;
+            if rn != 0 {
+                raw += *self.encodings.get(n)?.get(rn as usize)?;
             }
         }
-        Some(Mono(raw | ((weight as u128) << WEIGHT_SHIFT)))
+        Some(Mono(raw))
+    }
+
+    /// The position index and value $p^i$ of each non-zero digit unit of `m` at `p = 2`, or
+    /// `None` at odd primes.
+    pub(crate) fn bit_positions(&self) -> Option<&[(u8, u32)]> {
+        (self.p == 2).then_some(&self.bit_positions[..])
     }
 
     /// The exterior part and the sequence $R$ of $Q(E) P(R)$, without trailing zeros.
@@ -364,7 +387,7 @@ impl Params {
             if r.len() < n {
                 r.resize(n, 0);
             }
-            r[n - 1] += d * self.p.pow(pos.exp);
+            r[n - 1] += d * pos.value;
         }
         (m.q_part(), r)
     }

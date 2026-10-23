@@ -406,10 +406,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 let rows = (start..i)
                     .map(|g| {
                         let mut v = FpVector::new(p, dim);
-                        for &(m, c) in inner.differential(s as u32, g).terms() {
-                            let (gen_deg, gen_idx) = target_positions[m.generator as usize];
-                            let op_deg = self.params.degree(m.mono);
-                            let op_idx = milnor_index(&self.params, &algebra, m.mono);
+                        for (m, c) in inner.differential(s as u32, g).terms() {
+                            let (gen_deg, gen_idx) = target_positions[m.generator() as usize];
+                            let op_deg = self.params.degree(m.mono());
+                            let op_idx = milnor_index(&self.params, &algebra, m.mono());
                             debug_assert_eq!(op_deg + gen_deg, t);
                             let idx = target.generator_offset(t, gen_deg, gen_idx) + op_idx;
                             v.add_basis_element(idx, c);

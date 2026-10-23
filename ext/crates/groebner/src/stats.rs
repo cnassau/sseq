@@ -93,7 +93,8 @@ impl<W: Write + Send> PairObserver for PairLog<W> {
             None => line += ",\"kind\":\"relation\"",
             Some(ctx) => {
                 let params = ctx.params;
-                let lead = |l: ModMono| format!("[{},\"{}\"]", l.generator, params.format(l.mono));
+                let lead =
+                    |l: ModMono| format!("[{},\"{}\"]", l.generator(), params.format(l.mono()));
                 let pair = ctx.pair;
                 line += &format!(
                     ",\"kind\":\"{}\",\"i1\":{},\"i2\":{},\"m1\":\"{}\",\"m2\":\"{}\",\

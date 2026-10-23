@@ -14,26 +14,64 @@ use crate::{
     poly::Merger,
 };
 
+/// The May filtration of a leading term together with its generator, ordered like Lin's `Filtr`:
+/// larger generators are smaller.
+pub type Filtration = (u32, u32);
+
+/// The [`Filtration`] of `m`.
+pub fn filtration(params: &Params, m: ModMono) -> Filtration {
+    (!m.generator, params.may_filtration(m.mono))
+}
+
 /// An element $(x_1, x_2)$ of $C_s \oplus C_{s+1}$ with $d x_2 = x_1$.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// When x2m pruning is on, `x2m` expresses the part of $x_1$ of filtration `fil` in the
+/// associated graded of the May filtration, in terms of the leading parts of earlier elements. It
+/// is only meaningful while `fil` is the filtration of the leading term of $x_1$, see
+/// [`x2m_valid`](Self::x2m_valid).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GbElement {
     /// The component in $C_s$.
     pub x1: Poly,
     /// The component in $C_{s+1}$.
     pub x2: Poly,
+    /// The May-graded shadow of $x_1$, on the x2m generators of the level.
+    pub x2m: Poly,
+    /// The filtration `x2m` belongs to.
+    pub fil: Filtration,
+}
+
+impl Default for GbElement {
+    fn default() -> Self {
+        Self::new(Poly::zero(), Poly::zero())
+    }
 }
 
 impl GbElement {
-    /// Add `c * other`.
-    pub fn add_scaled(&mut self, other: &Self, c: u32, p: u32) {
-        self.x1.add_scaled(&other.x1, c, p);
-        self.x2.add_scaled(&other.x2, c, p);
+    /// The element $(x_1, x_2)$ without an x2m component.
+    pub fn new(x1: Poly, x2: Poly) -> Self {
+        Self {
+            x1,
+            x2,
+            x2m: Poly::zero(),
+            fil: (u32::MAX, u32::MAX),
+        }
+    }
+
+    /// Whether `x2m` still describes the leading part of $x_1$. Once that part has cancelled, a
+    /// non-zero `x2m` is a relation among the leading parts of earlier elements instead.
+    pub fn x2m_valid(&self, params: &Params) -> bool {
+        match self.x1.lead() {
+            Some((lead, _)) => self.fil == filtration(params, lead),
+            None => self.x2m.is_zero(),
+        }
     }
 
     /// Multiply by the scalar `c`.
     pub fn scale(&mut self, c: u32, p: u32) {
         self.x1.scale(c, p);
         self.x2.scale(c, p);
+        self.x2m.scale(c, p);
     }
 
     /// Scale so that the leading coefficient of `x1` is one.
@@ -53,6 +91,15 @@ const CACHE_TERMS_LIMIT: usize = 1 << 20;
 enum Component {
     X1,
     X2,
+    X2m,
+}
+
+/// The x2m component a reduction carries along, and the filtration it belongs to.
+pub struct X2mTrack<'a> {
+    /// The x2m component.
+    pub x2m: &'a mut Poly,
+    /// The filtration of the element being reduced.
+    pub fil: Filtration,
 }
 
 /// Products $u \cdot g$ of basis elements by monomials already computed by this thread, valid
@@ -76,10 +123,16 @@ thread_local! {
 /// A Gröbner basis of the graph of $d \colon C_{s+1} \to C_s$, ordered by the $C_s$ component.
 ///
 /// Elements are normalized to have leading coefficient one.
+///
+/// The same structure holds the x2m bases, which are Gröbner bases of submodules of free modules
+/// over the associated graded algebra of the May filtration. There only $x_1$ is used, and
+/// products keep the terms of the right May filtration.
 #[derive(Debug)]
 pub struct Level {
     /// Distinguishes levels in the thread-local product caches.
     id: u64,
+    /// Whether products are taken in the associated graded algebra of the May filtration.
+    may: bool,
     elements: Vec<GbElement>,
     leads: Vec<ModMono>,
     by_generator: FxHashMap<u32, Vec<u32>>,
@@ -89,9 +142,20 @@ pub struct Level {
 impl Level {
     /// An empty level whose pairs are truncated at `t_trunc`.
     pub fn new(t_trunc: i32) -> Self {
+        Self::with_products(t_trunc, false)
+    }
+
+    /// An empty x2m basis whose pairs are truncated at `t_trunc`.
+    pub fn new_may(t_trunc: i32) -> Self {
+        Self::with_products(t_trunc, true)
+    }
+
+    /// An empty level with products in the associated graded algebra if `may` is set.
+    fn with_products(t_trunc: i32, may: bool) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            may,
             elements: Vec::new(),
             leads: Vec::new(),
             by_generator: FxHashMap::default(),
@@ -158,29 +222,65 @@ impl Level {
             .find(|&k| params.divides(self.leads[k].mono, m.mono))
     }
 
-    /// The element of a critical pair or single, with the leading terms cancelled.
-    pub fn pair_element(&self, params: &Params, pair: &Pair) -> GbElement {
+    /// The product `m * x`, in the associated graded algebra for an x2m basis.
+    fn mul(&self, params: &Params, m: Mono, x: &Poly) -> Poly {
+        if self.may {
+            params.mul_may_poly(m, 1, x)
+        } else {
+            params.mul_poly(m, 1, x)
+        }
+    }
+
+    /// The element of a critical pair or single, with the leading terms cancelled. With
+    /// `track_x2m`, its x2m component and filtration are computed as well.
+    pub fn pair_element(&self, params: &Params, pair: &Pair, track_x2m: bool) -> GbElement {
         let p = params.prime();
-        let g2 = &self.elements[pair.i2 as usize];
-        let mut b = GbElement {
-            x1: params.mul_poly(pair.m2, 1, &g2.x1),
-            x2: params.mul_poly(pair.m2, 1, &g2.x2),
+        let side = |k: u32, m: Mono| {
+            let g = &self.elements[k as usize];
+            let mut e = GbElement::new(self.mul(params, m, &g.x1), self.mul(params, m, &g.x2));
+            if track_x2m {
+                e.x2m = params.mul_may_poly(m, 1, &g.x2m);
+                e.fil = (g.fil.0, g.fil.1 + params.may_filtration(m));
+            }
+            e
         };
+        let mut b = side(pair.i2, pair.m2);
         if pair.is_single() {
             return b;
         }
-        let g1 = &self.elements[pair.i1 as usize];
-        let a = GbElement {
-            x1: params.mul_poly(pair.m1, 1, &g1.x1),
-            x2: params.mul_poly(pair.m1, 1, &g1.x2),
-        };
+        let a = side(pair.i1, pair.m1);
         let (la, ca) = a.x1.lead().unwrap();
         let (lb, cb) = b.x1.lead().unwrap();
         debug_assert_eq!(la, lb, "the leading terms of a critical pair differ");
         // ca * b - cb * a
         b.scale(ca, p);
-        b.add_scaled(&a, params.neg(cb), p);
+        let c = params.neg(cb);
+        b.x1.add_scaled(&a.x1, c, p);
+        b.x2.add_scaled(&a.x2, c, p);
+        b.x2m.add_scaled(&a.x2m, c, p);
         b
+    }
+
+    /// The x2m component of a critical pair or single, as in [`pair_element`](Self::pair_element).
+    pub fn pair_x2m(&self, params: &Params, pair: &Pair) -> Poly {
+        let p = params.prime();
+        let g2 = &self.elements[pair.i2 as usize];
+        let mut x = params.mul_may_poly(pair.m2, 1, &g2.x2m);
+        if pair.is_single() {
+            return x;
+        }
+        let g1 = &self.elements[pair.i1 as usize];
+        let ca = params.lf_coefficient(pair.m1, self.leads[pair.i1 as usize].mono);
+        let cb = params.lf_coefficient(pair.m2, self.leads[pair.i2 as usize].mono);
+        x.scale(ca, p);
+        x.add_scaled(&params.mul_may_poly(pair.m1, 1, &g1.x2m), params.neg(cb), p);
+        x
+    }
+
+    /// The filtration of the x2m component of a critical pair or single.
+    pub fn pair_filtration(&self, params: &Params, pair: &Pair) -> Filtration {
+        let fil = self.elements[pair.i2 as usize].fil;
+        (fil.0, fil.1 + params.may_filtration(pair.m2))
     }
 
     /// The product of the monomial `u` with a component of element `k`.
@@ -198,11 +298,11 @@ impl Level {
                 return Rc::clone(prod);
             }
             let g = &self.elements[k];
-            let x = match component {
-                Component::X1 => &g.x1,
-                Component::X2 => &g.x2,
-            };
-            let prod = Rc::new(params.mul_poly(u, 1, x));
+            let prod = Rc::new(match component {
+                Component::X1 => self.mul(params, u, &g.x1),
+                Component::X2 => self.mul(params, u, &g.x2),
+                Component::X2m => params.mul_may_poly(u, 1, &g.x2m),
+            });
             cache.terms += prod.num_terms();
             cache.products.insert(key, Rc::clone(&prod));
             prod
@@ -211,12 +311,23 @@ impl Level {
 
     /// Reduce `x` completely modulo the $C_s$ components, applying the same operations to
     /// `companion`, if given. Returns the number of reduction steps.
-    pub fn reduce(&self, params: &Params, x: &mut Poly, companion: Option<&mut Poly>) -> u64 {
+    ///
+    /// With `track`, a step that cancels a term of the tracked filtration while the leading term
+    /// of `x` still has that filtration also applies to the x2m component, in the associated
+    /// graded algebra.
+    pub fn reduce(
+        &self,
+        params: &Params,
+        x: &mut Poly,
+        companion: Option<&mut Poly>,
+        track: Option<X2mTrack>,
+    ) -> u64 {
         let p = params.prime();
         let mut merger = Merger::default();
         merger.add(Rc::new(std::mem::take(x)), 1, 0);
         let mut companions: Vec<(u32, Rc<Poly>)> = Vec::new();
-        let mut out = Vec::new();
+        let mut x2ms: Vec<(u32, Rc<Poly>)> = Vec::new();
+        let mut out: Vec<(ModMono, u32)> = Vec::new();
         let mut steps = 0;
         while let Some((m, c)) = merger.next_term(p) {
             let Some(k) = self.find_divisor(params, m) else {
@@ -229,6 +340,14 @@ impl Level {
             let (lead, lambda) = prod.lead().unwrap();
             debug_assert_eq!(lead, m);
             let factor = params.neg(c * params.inverse(lambda) % p);
+            if let Some(track) = &track {
+                let current_lead = out.first().map_or(m, |&(l, _)| l);
+                if filtration(params, current_lead) == track.fil
+                    && filtration(params, m) == track.fil
+                {
+                    x2ms.push((factor, self.product(params, k, u, Component::X2m)));
+                }
+            }
             // The leading term of the product cancels `m`.
             merger.add(prod, factor, 1);
             if companion.is_some() {
@@ -236,17 +355,49 @@ impl Level {
             }
         }
         *x = Poly::from_sorted_terms(out);
-        if let Some(companion) = companion
-            && !companions.is_empty()
-        {
+        let merge_into = |target: &mut Poly, parts: Vec<(u32, Rc<Poly>)>| {
+            if parts.is_empty() {
+                return;
+            }
             let mut merger = Merger::default();
-            merger.add(Rc::new(std::mem::take(companion)), 1, 0);
-            for (factor, prod) in companions {
+            merger.add(Rc::new(std::mem::take(target)), 1, 0);
+            for (factor, prod) in parts {
                 merger.add(prod, factor, 0);
             }
-            *companion = merger.finish(p);
+            *target = merger.finish(p);
+        };
+        if let Some(companion) = companion {
+            merge_into(companion, companions);
+        }
+        if let Some(track) = track {
+            merge_into(track.x2m, x2ms);
         }
         steps
+    }
+
+    /// Reduce the leading terms of `r` against `against`, which must all be of the same degree as
+    /// `r` and triangular among themselves. With `track_x2m`, the x2m components are added
+    /// whenever the filtrations agree and that of `r` is valid.
+    pub fn triangulate_element(
+        params: &Params,
+        r: &mut GbElement,
+        against: &[GbElement],
+        track_x2m: bool,
+    ) {
+        let p = params.prime();
+        for g in against {
+            let (lead, _) = g.x1.lead().unwrap();
+            let c = r.x1.coefficient(lead);
+            if c == 0 {
+                continue;
+            }
+            let c = params.neg(c);
+            if track_x2m && r.fil == g.fil && r.x2m_valid(params) {
+                r.x2m.add_scaled(&g.x2m, c, p);
+            }
+            r.x1.add_scaled(&g.x1, c, p);
+            r.x2.add_scaled(&g.x2, c, p);
+        }
     }
 
     /// Reduce the leading terms of `x` against the elements with the given indices, which must

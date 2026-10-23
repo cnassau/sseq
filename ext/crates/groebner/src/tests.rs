@@ -142,6 +142,37 @@ fn leading_terms_multiply(#[case] p: u32, #[case] kind: SteenrodKind, #[case] ma
     }
 }
 
+/// Every term of a product has May filtration at least the sum of those of the factors, which
+/// makes the May-graded product well defined.
+#[rstest]
+#[case(2, SteenrodKind::Classical, 40)]
+#[case(2, SteenrodKind::MotivicModTau, 40)]
+#[case(3, SteenrodKind::Classical, 70)]
+#[case(3, SteenrodKind::ReducedPowers, 70)]
+#[case(5, SteenrodKind::Classical, 100)]
+fn may_filtration_is_multiplicative(#[case] p: u32, #[case] kind: SteenrodKind, #[case] max: i32) {
+    let algebra = milnor_algebra(p, kind);
+    let params = Params::new(p, kind);
+    for d1 in 0..=max {
+        for d2 in 0..=max - d1 {
+            for a in basis(&algebra, &params, d1) {
+                for b in basis(&algebra, &params, d2) {
+                    let w = params.may_filtration(a) + params.may_filtration(b);
+                    params.mul(a, b, |m, _| {
+                        assert!(
+                            params.may_filtration(m) >= w,
+                            "{} * {} has the term {}",
+                            params.format(a),
+                            params.format(b),
+                            params.format(m)
+                        );
+                    });
+                }
+            }
+        }
+    }
+}
+
 #[rstest]
 #[case(2, SteenrodKind::Classical, 60)]
 #[case(2, SteenrodKind::MotivicModTau, 60)]
@@ -247,12 +278,13 @@ mod resolution {
         let plain = sphere(2, SteenrodKind::Classical, 6, 20);
         assert_eq!(counts(&audited), counts(&plain));
 
-        let mut useless = 0;
+        let mut redundant = 0;
         let mut useful = 0;
         for (&(s, _), st) in audited.stats().steps() {
             if s >= 0 {
-                useless += st.useless;
-                useful += st.reduced - st.useless;
+                let r = st.useless + st.boundaries + st.beyond;
+                redundant += r;
+                useful += st.reduced - r;
             }
         }
         let report = audited.filter_report();
@@ -264,8 +296,8 @@ mod resolution {
                     (c + x.correct, w + x.wrong, m + x.missed)
                 })
         };
-        assert_eq!(total(0), (useless, useful, 0));
-        assert_eq!(total(1), (0, 0, useless));
+        assert_eq!(total(0), (redundant, useful, 0));
+        assert_eq!(total(1), (0, 0, redundant));
     }
 
     /// A filter in force that predicts nothing changes nothing.
@@ -287,5 +319,35 @@ mod resolution {
             counts(&sphere(3, SteenrodKind::Classical, 5, 40))
         );
         assert!(res.stats().total().useless > 0);
+    }
+
+    /// Lin's x2m pruning discards pairs, all of them redundant, without changing the result.
+    #[rstest::rstest]
+    #[case(2, SteenrodKind::Classical, 15, 40)]
+    #[case(2, SteenrodKind::MotivicModTau, 12, 30)]
+    #[case(3, SteenrodKind::Classical, 10, 80)]
+    #[case(3, SteenrodKind::ReducedPowers, 8, 100)]
+    #[case(5, SteenrodKind::Classical, 6, 150)]
+    fn x2m(#[case] p: u32, #[case] kind: SteenrodKind, #[case] s_max: u32, #[case] n_max: i32) {
+        let plain = sphere(p, kind, s_max, n_max);
+        for mode in [FilterMode::Audit, FilterMode::Enforce] {
+            let params = Arc::new(Params::new(p, kind));
+            let mut res = Resolution::sphere(params, Bounds { s_max, n_max });
+            res.enable_x2m(mode);
+            res.compute_through(n_max + s_max as i32);
+            assert_eq!(counts(&res), counts(&plain));
+            let report = res.filter_report();
+            let (discarded, correct, wrong) = report.filters[0]
+                .2
+                .values()
+                .fold((0, 0, 0), |(d, c, w), x| {
+                    (d + x.discarded, c + x.correct, w + x.wrong)
+                });
+            assert_eq!(wrong, 0);
+            match mode {
+                FilterMode::Audit => assert!(correct > 0),
+                FilterMode::Enforce => assert!(discarded > 0),
+            }
+        }
     }
 }

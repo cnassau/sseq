@@ -17,9 +17,18 @@ pub enum Outcome {
     /// The $C_s$ component vanished and the cycle in $C_{s+1}$ became a new generator of
     /// $C_{s+2}$.
     NewGenerator,
+    /// The $C_s$ component vanished, and the cycle would give a generator beyond the largest
+    /// homological degree. Whether it is a boundary is not known.
+    Beyond,
 }
 
 impl Outcome {
+    /// Whether the reduction added nothing, so that skipping it would not have changed the
+    /// resolution.
+    pub fn is_redundant(self) -> bool {
+        matches!(self, Self::Useless | Self::Boundary | Self::Beyond)
+    }
+
     /// A short name.
     pub fn name(self) -> &'static str {
         match self {
@@ -27,6 +36,7 @@ impl Outcome {
             Self::NewElement => "element",
             Self::Boundary => "boundary",
             Self::NewGenerator => "generator",
+            Self::Beyond => "beyond",
         }
     }
 }
@@ -131,6 +141,8 @@ pub struct StepStats {
     pub boundaries: u64,
     /// Reductions with [`Outcome::NewGenerator`].
     pub new_generators: u64,
+    /// Reductions with [`Outcome::Beyond`].
+    pub beyond: u64,
 }
 
 impl StepStats {
@@ -143,6 +155,7 @@ impl StepStats {
             Outcome::NewElement => self.new_elements += 1,
             Outcome::Boundary => self.boundaries += 1,
             Outcome::NewGenerator => self.new_generators += 1,
+            Outcome::Beyond => self.beyond += 1,
         }
     }
 
@@ -158,6 +171,7 @@ impl StepStats {
         self.new_elements += other.new_elements;
         self.boundaries += other.boundaries;
         self.new_generators += other.new_generators;
+        self.beyond += other.beyond;
     }
 }
 
@@ -201,7 +215,7 @@ impl fmt::Display for Stats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "{:>5} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12}",
+            "{:>5} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12}",
             "s",
             "formed",
             "divisible",
@@ -212,12 +226,13 @@ impl fmt::Display for Stats {
             "elements",
             "boundary",
             "gens",
+            "beyond",
             "steps"
         )?;
         let row = |f: &mut fmt::Formatter<'_>, label: String, st: &StepStats| {
             writeln!(
                 f,
-                "{label:>5} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12}",
+                "{label:>5} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12}",
                 st.pairs.formed,
                 st.pairs.divisible,
                 st.pairs.chain,
@@ -227,6 +242,7 @@ impl fmt::Display for Stats {
                 st.new_elements,
                 st.boundaries,
                 st.new_generators,
+                st.beyond,
                 st.steps
             )
         };

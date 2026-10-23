@@ -186,6 +186,7 @@ pub struct Resolution<M: ZeroModule<Algebra = MilnorAlgebra>> {
     chain_maps: OnceBiVec<Arc<FreeModuleHomomorphism<M>>>,
     save_dir: SaveDirectory,
     observer: Mutex<Option<Box<dyn ::groebner::PairObserver>>>,
+    x2m: Mutex<Option<::groebner::FilterMode>>,
 }
 
 impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
@@ -216,6 +217,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             target,
             save_dir: SaveDirectory::None,
             observer: Mutex::new(None),
+            x2m: Mutex::new(None),
         })
     }
 
@@ -232,6 +234,18 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     /// Install an observer that sees every reduction of the next computation.
     pub fn set_observer(&self, observer: Option<Box<dyn ::groebner::PairObserver>>) {
         *self.observer.lock().unwrap() = observer;
+    }
+
+    /// Use Lin's x2m pruning of critical pairs in the next computation, see
+    /// [`groebner::Resolution::enable_x2m`](::groebner::Resolution::enable_x2m).
+    pub fn set_x2m(&self, mode: Option<::groebner::FilterMode>) {
+        *self.x2m.lock().unwrap() = mode;
+    }
+
+    /// How the pair filters fared, if the computation has started.
+    pub fn filter_report(&self) -> Option<::groebner::FilterReport> {
+        let state = self.lock.lock().unwrap();
+        state.inner.as_ref().map(|r| r.filter_report())
     }
 
     /// The counters of the computation, if it has started.
@@ -309,6 +323,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 bounds,
             );
             inner.set_observer(self.observer.lock().unwrap().take());
+            if let Some(mode) = *self.x2m.lock().unwrap() {
+                inner.enable_x2m(mode);
+            }
             state.generator_images = presentation.generator_images;
             state.inner = Some(inner);
         }

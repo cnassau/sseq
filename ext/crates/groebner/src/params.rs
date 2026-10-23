@@ -379,6 +379,20 @@ impl Params {
                 .sum::<i32>()
     }
 
+    /// The May filtration of `m`: each unit of a digit of $\xi_n^{p^i}$ counts $n$, and $Q_k$
+    /// counts $k + 1$.
+    ///
+    /// The May weight of the monomial order counts $2n - 1$ and $2k + 1$ instead, so this is half
+    /// of the weight plus the number of digit units and exterior generators.
+    pub fn may_filtration(&self, m: Mono) -> u32 {
+        let units = if self.p == 2 {
+            m.digits().count_ones()
+        } else {
+            self.digits(m).map(|(_, d)| d).sum()
+        };
+        (m.weight() + units + m.ext_degree()) / 2
+    }
+
     /// The monomial with the same digits and exterior part as `m` and the correct weight.
     fn reweigh(&self, m: Mono) -> Mono {
         let raw = Mono(m.0 & !(u128::MAX << WEIGHT_SHIFT));

@@ -1,12 +1,13 @@
 //! Resolve the sphere and print the number of generators in each bidegree.
 //!
 //! Usage: `sphere <p> <kind> <s_max> <n_max> [pair-log.jsonl]`, where kind is one of
-//! `classical`, `motivic` and `reduced`.
+//! `classical`, `motivic` and `reduced`. Set `X2M` to `audit` or `enforce` to turn on Lin's x2m
+//! pruning.
 
 use std::sync::Arc;
 
 use algebra::SteenrodKind;
-use groebner::{Bounds, PairLog, Params, Resolution};
+use groebner::{Bounds, FilterMode, PairLog, Params, Resolution};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -22,6 +23,12 @@ fn main() {
 
     let params = Arc::new(Params::new(p, kind));
     let mut res = Resolution::sphere(params, Bounds { s_max, n_max });
+    match std::env::var("X2M").as_deref() {
+        Ok("audit") => res.enable_x2m(FilterMode::Audit),
+        Ok("enforce") => res.enable_x2m(FilterMode::Enforce),
+        Ok(other) => panic!("unknown X2M mode {other}"),
+        Err(_) => {}
+    }
     if let Some(path) = args.get(5) {
         let file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
         res.set_observer(Some(Box::new(PairLog::new(file))));
@@ -47,6 +54,7 @@ fn main() {
     }
     println!();
     print!("{}", res.stats());
+    print!("{}", res.filter_report());
     println!("time: {elapsed:?}");
     let (mut x1, mut x2, mut n) = (0, 0, 0);
     for s in 0..s_max {

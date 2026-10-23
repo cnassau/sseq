@@ -6,8 +6,8 @@ use maybe_rayon::prelude::*;
 
 use crate::{
     ModMono, Mono, Params, Poly,
-    filter::{FilterMode, FilterReport, InstalledFilter, PairContext, PairFilter},
-    level::{GbElement, Level},
+    filter::{FilterCounts, FilterMode, FilterReport, InstalledFilter, PairContext, PairFilter},
+    level::{GbElement, Level, X2mTrack, filtration},
     pairs::Pair,
     stats::{Outcome, PairEvent, PairObserver, Stats},
 };
@@ -28,6 +28,102 @@ pub struct Bounds {
     pub s_max: u32,
     /// The largest stem $t - s$.
     pub n_max: i32,
+}
+
+/// The index standing for x2m pruning among the predictions of a pair.
+const X2M_FILTER: u16 = u16::MAX;
+/// The name of x2m pruning in reports and logs.
+const X2M_NAME: &str = "x2m";
+
+/// Lin's pruning of critical pairs through the associated graded algebra of the May filtration.
+///
+/// Every element of level `s` carries an x2m component, an element of a free module over the
+/// associated graded algebra on the x2m generators of the level. A fresh generator is attached to
+/// every element whose leading part is new: one coming from a cycle, and one whose leading part
+/// changed filtration during reduction. When the leading part of a reduction cancels instead, its
+/// x2m component is a relation among the leading parts of earlier elements. The relations are
+/// collected into a Gröbner basis, and a critical pair whose x2m component reduces to zero modulo
+/// the relations and the other pairs of its degree is predicted to be useless.
+struct X2m {
+    mode: FilterMode,
+    /// The Gröbner bases of the relations, one per level.
+    levels: Vec<Level>,
+    /// `degrees[s][i]` is the degree of the `i`th x2m generator of level `s`.
+    degrees: Vec<Vec<i32>>,
+    counts: BTreeMap<u32, FilterCounts>,
+}
+
+impl X2m {
+    /// A fresh x2m generator of level `s` in degree `t`.
+    fn new_generator(&mut self, s: usize, t: i32) -> Poly {
+        let index = self.degrees[s].len() as u32;
+        self.degrees[s].push(t);
+        Poly::monomial(ModMono::new(index, Mono::ONE), 1)
+    }
+
+    /// Add a relation with leading coefficient one to the basis of level `s`.
+    fn push(&mut self, params: &Params, s: usize, rel: GbElement) {
+        let lead = rel.x1.lead().unwrap().0;
+        let degree = self.degrees[s][lead.generator as usize];
+        self.levels[s].push(params, rel, degree);
+    }
+
+    /// Reduce the critical pairs of degree `t` of the relations of level `s`, and add the results
+    /// to the basis.
+    fn complete_basis(&mut self, params: &Params, s: usize, t: i32) {
+        let (pairs, _) = self.levels[s].take_pairs(params, t);
+        let mut new: Vec<GbElement> = Vec::new();
+        for pair in pairs {
+            let mut e = self.levels[s].pair_element(params, &pair, false);
+            self.levels[s].reduce(params, &mut e.x1, None, None);
+            Level::triangulate(params, &mut e.x1, None, &new);
+            if !e.x1.is_zero() {
+                e.normalize(params);
+                new.push(e);
+            }
+        }
+        for rel in new {
+            self.push(params, s, rel);
+        }
+    }
+
+    /// Mark the pairs of level `s` whose x2m components are spanned by the relations and the
+    /// pairs before them, after ordering the pairs by decreasing filtration. In
+    /// [`FilterMode::Enforce`] they are discarded instead.
+    fn predict(
+        &mut self,
+        params: &Params,
+        level: &Level,
+        s: usize,
+        mut pairs: Vec<(Option<Pair>, Vec<u16>)>,
+    ) -> Vec<(Option<Pair>, Vec<u16>)> {
+        let p = params.prime();
+        let fil = |pair: &Option<Pair>| level.pair_filtration(params, pair.as_ref().unwrap());
+        pairs.sort_by_key(|(pair, _)| std::cmp::Reverse(fil(pair)));
+        let mut seen: Vec<GbElement> = Vec::new();
+        let mut kept = Vec::with_capacity(pairs.len());
+        for (pair, mut predicted) in pairs {
+            let mut x = level.pair_x2m(params, pair.as_ref().unwrap());
+            self.levels[s].reduce(params, &mut x, None, None);
+            Level::triangulate(params, &mut x, None, &seen);
+            if let Some((_, c)) = x.lead() {
+                x.scale(params.inverse(c), p);
+                seen.push(GbElement::new(x, Poly::zero()));
+                kept.push((pair, predicted));
+                continue;
+            }
+            match self.mode {
+                FilterMode::Enforce => {
+                    self.counts.entry(s as u32).or_default().discarded += 1;
+                }
+                FilterMode::Audit => {
+                    predicted.push(X2M_FILTER);
+                    kept.push((pair, predicted));
+                }
+            }
+        }
+        kept
+    }
 }
 
 /// The outcome of reducing one pair or relation, before it is sorted into the basis.
@@ -59,6 +155,7 @@ pub struct Resolution {
     stats: Stats,
     observer: Option<Box<dyn PairObserver>>,
     filters: Vec<InstalledFilter>,
+    x2m: Option<X2m>,
 }
 
 impl Resolution {
@@ -106,6 +203,7 @@ impl Resolution {
             stats: Stats::default(),
             observer: None,
             filters: Vec::new(),
+            x2m: None,
         }
     }
 
@@ -139,15 +237,39 @@ impl Resolution {
         });
     }
 
+    /// Turn on Lin's x2m pruning. In [`FilterMode::Audit`], the pairs it would discard are
+    /// reduced anyway and the predictions are recorded in the [`filter_report`](Self::filter_report)
+    /// under the name "x2m".
+    ///
+    /// # Panics
+    ///
+    /// If anything has been computed already.
+    pub fn enable_x2m(&mut self, mode: FilterMode) {
+        assert_eq!(
+            self.t_done, self.min_degree,
+            "x2m pruning must be enabled before computing"
+        );
+        self.x2m = Some(X2m {
+            mode,
+            levels: (0..self.levels.len())
+                .map(|_| Level::new_may(self.min_degree - 1))
+                .collect(),
+            degrees: vec![Vec::new(); self.levels.len()],
+            counts: BTreeMap::new(),
+        });
+    }
+
     /// How the installed filters fared.
     pub fn filter_report(&self) -> FilterReport {
-        FilterReport {
-            filters: self
-                .filters
-                .iter()
-                .map(|f| (f.filter.name().to_string(), f.mode, f.counts.clone()))
-                .collect(),
+        let mut filters: Vec<_> = self
+            .filters
+            .iter()
+            .map(|f| (f.filter.name().to_string(), f.mode, f.counts.clone()))
+            .collect();
+        if let Some(x2m) = &self.x2m {
+            filters.push((X2M_NAME.to_string(), x2m.mode, x2m.counts.clone()));
         }
+        FilterReport { filters }
     }
 
     /// The algebra.
@@ -215,6 +337,15 @@ impl Resolution {
                         t_trunc,
                         self.t_done + 1,
                     );
+                    if let Some(x2m) = &mut self.x2m {
+                        let degrees = &x2m.degrees[s];
+                        x2m.levels[s].retruncate(
+                            &self.params,
+                            |g| degrees[g as usize],
+                            t_trunc,
+                            self.t_done + 1,
+                        );
+                    }
                 }
             }
         }
@@ -253,6 +384,7 @@ impl Resolution {
         params.clear_product_cache();
         let p = params.prime();
         let num_levels = self.levels.len();
+        let track = self.x2m.is_some();
 
         // `work[s + 1]` are the pairs of level `s`, or the relations for `s = -1`, each with the
         // audited filters that predict it to be useless.
@@ -267,8 +399,12 @@ impl Resolution {
             if !self.active(s as i32, t) {
                 continue;
             }
+            if let Some(x2m) = &mut self.x2m {
+                x2m.complete_basis(&params, s, t);
+            }
             let (pairs, counts) = self.levels[s].take_pairs(&params, t);
             self.stats.get_mut(s as i32, t).pairs = counts;
+            let mut kept = Vec::new();
             for pair in pairs {
                 let ctx = Self::context(&params, &self.levels, &self.generators, s, t, &pair);
                 let mut predicted = Vec::new();
@@ -287,9 +423,17 @@ impl Resolution {
                     }
                 }
                 if !discard {
-                    work[s + 1].push((Some(pair), predicted));
+                    kept.push((Some(pair), predicted));
                 }
             }
+            if let Some(x2m) = &mut self.x2m {
+                kept = x2m.predict(&params, &self.levels[s], s, kept);
+            }
+            // A prediction is right if the pair adds nothing to the others, so reduce the pairs
+            // under audit last. This changes which pairs become elements, but not their leading
+            // terms.
+            kept.sort_by_key(|(_, predicted)| !predicted.is_empty());
+            work[s + 1] = kept;
         }
         if work.iter().all(Vec::is_empty) {
             return;
@@ -298,6 +442,7 @@ impl Resolution {
         // Each level is reduced by one task, so that the products cached while reducing one pair
         // are at hand for the others.
         let levels = &self.levels;
+        let x2m_levels = self.x2m.as_ref().map(|x| &x.levels);
         let mut by_level: Vec<Vec<Reduced>> = work
             .into_maybe_par_iter()
             .enumerate()
@@ -308,22 +453,22 @@ impl Resolution {
                     .enumerate()
                     .map(|(idx, (pair, predicted))| {
                         let (mut element, mut steps) = match pair {
-                            None => (
-                                GbElement {
-                                    x1: Poly::zero(),
-                                    x2: relations[idx].clone(),
-                                },
-                                0,
-                            ),
+                            None => (GbElement::new(Poly::zero(), relations[idx].clone()), 0),
                             Some(pair) => {
                                 let level = &levels[s as usize];
-                                let mut e = level.pair_element(&params, &pair);
-                                let steps = level.reduce(&params, &mut e.x1, Some(&mut e.x2));
+                                let mut e = level.pair_element(&params, &pair, track);
+                                let GbElement { x1, x2, x2m, fil } = &mut e;
+                                let track = track.then_some(X2mTrack { x2m, fil: *fil });
+                                let mut steps = level.reduce(&params, x1, Some(x2), track);
+                                if let Some(x2m_levels) = x2m_levels {
+                                    steps += x2m_levels[s as usize]
+                                        .reduce(&params, &mut e.x2m, None, None);
+                                }
                                 (e, steps)
                             }
                         };
                         if let Some(next) = levels.get((s + 1) as usize) {
-                            steps += next.reduce(&params, &mut element.x2, None);
+                            steps += next.reduce(&params, &mut element.x2, None, None);
                         }
                         Reduced {
                             s,
@@ -338,29 +483,40 @@ impl Resolution {
             .collect();
 
         let mut new: Vec<Vec<GbElement>> = vec![Vec::new(); num_levels];
+        // New relations among the x2m generators of each level.
+        let mut new_x2m: Vec<Vec<GbElement>> = vec![Vec::new(); num_levels];
         let mut events: Vec<(Reduced, Outcome)> = Vec::new();
         for s in (-1..num_levels as i32).rev() {
             let mut kernels: Vec<Reduced> = Vec::new();
+            let mut x2m_cycles: Vec<Poly> = Vec::new();
             for mut r in std::mem::take(&mut by_level[(s + 1) as usize]) {
                 if s >= 0 {
-                    Level::triangulate(
-                        &params,
-                        &mut r.element.x1,
-                        Some(&mut r.element.x2),
-                        &new[s as usize],
-                    );
+                    Level::triangulate_element(&params, &mut r.element, &new[s as usize], track);
                 }
                 if let Some(next) = new.get((s + 1) as usize) {
                     Level::triangulate(&params, &mut r.element.x2, None, next);
                 }
-                if !r.element.x1.is_zero() {
+                if let Some((lead, _)) = r.element.x1.lead() {
+                    let valid = r.element.x2m_valid(&params);
                     r.element.normalize(&params);
+                    if let Some(x2m) = &mut self.x2m
+                        && !valid
+                    {
+                        x2m_cycles.push(std::mem::take(&mut r.element.x2m));
+                        r.element.x2m = x2m.new_generator(s as usize, t);
+                        r.element.fil = filtration(&params, lead);
+                    }
                     new[s as usize].push(r.element.clone());
                     events.push((r, Outcome::NewElement));
-                } else if !r.element.x2.is_zero() {
-                    kernels.push(r);
                 } else {
-                    events.push((r, Outcome::Useless));
+                    if track && !r.element.x2m.is_zero() {
+                        x2m_cycles.push(std::mem::take(&mut r.element.x2m));
+                    }
+                    if r.element.x2.is_zero() {
+                        events.push((r, Outcome::Useless));
+                    } else {
+                        kernels.push(r);
+                    }
                 }
             }
 
@@ -374,7 +530,7 @@ impl Resolution {
                     continue;
                 };
                 if s2 > self.bounds.s_max as usize {
-                    events.push((r, Outcome::NewGenerator));
+                    events.push((r, Outcome::Beyond));
                     continue;
                 }
                 r.element.x2.scale(params.inverse(c), p);
@@ -387,13 +543,28 @@ impl Resolution {
                     ext_degree,
                 });
                 self.differentials[s2].push(cycle.clone());
-                if let Some(next) = new.get_mut(s2 - 1) {
-                    next.push(GbElement {
-                        x1: cycle,
-                        x2: Poly::monomial(ModMono::new(index, Mono::ONE), 1),
-                    });
+                if new.get(s2 - 1).is_some() {
+                    let mut element =
+                        GbElement::new(cycle, Poly::monomial(ModMono::new(index, Mono::ONE), 1));
+                    if let Some(x2m) = &mut self.x2m {
+                        element.x2m = x2m.new_generator(s2 - 1, t);
+                        element.fil = filtration(&params, lead);
+                    }
+                    new[s2 - 1].push(element);
                 }
                 events.push((r, Outcome::NewGenerator));
+            }
+
+            if s >= 0 {
+                for mut x in x2m_cycles {
+                    let rels = &new_x2m[s as usize];
+                    Level::triangulate(&params, &mut x, None, rels);
+                    if !x.is_zero() {
+                        let mut rel = GbElement::new(x, Poly::zero());
+                        rel.normalize(&params);
+                        new_x2m[s as usize].push(rel);
+                    }
+                }
             }
         }
 
@@ -402,15 +573,15 @@ impl Resolution {
             if r.pair.is_none() {
                 continue;
             }
-            let useless = *outcome == Outcome::Useless;
-            for (i, installed) in self.filters.iter_mut().enumerate() {
-                let counts = installed.counts.entry(r.s as u32).or_default();
-                match (r.predicted.contains(&(i as u16)), useless) {
+            let useless = outcome.is_redundant();
+            let record =
+                |counts: &mut FilterCounts, predicted: bool, name: &str| match (predicted, useless)
+                {
                     (true, true) => counts.correct += 1,
                     (true, false) => {
                         counts.wrong += 1;
                         tracing::warn!(
-                            filter = installed.filter.name(),
+                            filter = name,
                             s = r.s,
                             t,
                             ?outcome,
@@ -419,7 +590,18 @@ impl Resolution {
                     }
                     (false, true) => counts.missed += 1,
                     (false, false) => {}
-                }
+                };
+            for (i, installed) in self.filters.iter_mut().enumerate() {
+                let counts = installed.counts.entry(r.s as u32).or_default();
+                record(
+                    counts,
+                    r.predicted.contains(&(i as u16)),
+                    installed.filter.name(),
+                );
+            }
+            if let Some(x2m) = &mut self.x2m {
+                let counts = x2m.counts.entry(r.s as u32).or_default();
+                record(counts, r.predicted.contains(&X2M_FILTER), X2M_NAME);
             }
         }
         if let Some(observer) = &mut self.observer {
@@ -443,7 +625,13 @@ impl Resolution {
                 let predicted_by: Vec<&str> = r
                     .predicted
                     .iter()
-                    .map(|&i| self.filters[i as usize].filter.name())
+                    .map(|&i| {
+                        if i == X2M_FILTER {
+                            X2M_NAME
+                        } else {
+                            self.filters[i as usize].filter.name()
+                        }
+                    })
                     .collect();
                 observer.observe(&PairEvent {
                     s: r.s,
@@ -462,6 +650,13 @@ impl Resolution {
                 let lead = e.x1.lead().unwrap().0;
                 let degree = self.generators[s][lead.generator as usize].degree;
                 self.levels[s].push(&params, e, degree);
+            }
+        }
+        if let Some(x2m) = &mut self.x2m {
+            for (s, rels) in new_x2m.into_iter().enumerate() {
+                for rel in rels {
+                    x2m.push(&params, s, rel);
+                }
             }
         }
         tracing::debug!(

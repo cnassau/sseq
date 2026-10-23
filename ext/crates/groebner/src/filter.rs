@@ -74,16 +74,17 @@ pub fn mono_depth(params: &Params, m: Mono) -> u32 {
     p_depth.max(q_depth)
 }
 
-/// A criterion predicting that a critical pair reduces to zero.
+/// A criterion predicting that a critical pair is redundant, in the sense of
+/// [`Outcome::is_redundant`](crate::Outcome::is_redundant).
 pub trait PairFilter: Send + Sync {
     /// A short name, used in statistics and logs.
     fn name(&self) -> &str;
 
-    /// Whether the pair is predicted to reduce to zero.
+    /// Whether the pair is predicted to be redundant.
     fn skip(&self, ctx: &PairContext) -> bool;
 }
 
-/// What happens to the pairs a filter predicts to be useless.
+/// What happens to the pairs a filter predicts to be redundant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilterMode {
     /// Discard them. This changes the result if the prediction is wrong.
@@ -97,11 +98,11 @@ pub enum FilterMode {
 pub struct FilterCounts {
     /// Pairs discarded in [`FilterMode::Enforce`].
     pub discarded: u64,
-    /// Pairs predicted useless that were.
+    /// Pairs predicted redundant that were.
     pub correct: u64,
-    /// Pairs predicted useless that were not. In [`FilterMode::Enforce`] these cannot be seen.
+    /// Pairs predicted redundant that were not. In [`FilterMode::Enforce`] these cannot be seen.
     pub wrong: u64,
-    /// Useless pairs that were not predicted.
+    /// Redundant pairs that were not predicted.
     pub missed: u64,
 }
 

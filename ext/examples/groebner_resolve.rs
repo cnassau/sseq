@@ -3,8 +3,8 @@
 //!
 //! The algebra is the classical Steenrod algebra unless the environment variable `GROEBNER_KIND`
 //! is `motivic` (for $A^{\mathbb{C}}/\tau$ at $p = 2$) or `reduced` (for the reduced powers at an
-//! odd prime). If `GROEBNER_PAIR_LOG` names a file, every reduction is logged there as a line of
-//! JSON.
+//! odd prime). `GROEBNER_X2M`, `audit` or `enforce`, turns on Lin's x2m pruning. If
+//! `GROEBNER_PAIR_LOG` names a file, every reduction is logged there as a line of JSON.
 
 use ext::chain_complex::FreeChainComplex;
 use sseq::coordinates::Bidegree;
@@ -37,6 +37,9 @@ fn main() -> anyhow::Result<()> {
     println!("{}", res.graded_dimension_string());
     if let Some(stats) = res.stats() {
         print!("{stats}");
+    }
+    if let Some(report) = res.filter_report() {
+        print!("{report}");
     }
     eprintln!("time: {elapsed:?}");
     Ok(())

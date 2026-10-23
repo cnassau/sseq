@@ -189,7 +189,8 @@ where
 /// See [`construct`]. The algebra is the classical Steenrod algebra unless `kind` says otherwise.
 ///
 /// With the `groebner` feature, [`construct`] reads `kind` from the environment variable
-/// `GROEBNER_KIND`, which is one of `classical`, `motivic` and `reduced`.
+/// `GROEBNER_KIND`, which is one of `classical`, `motivic` and `reduced`. The environment variable
+/// `GROEBNER_X2M`, `audit` or `enforce`, turns on x2m pruning in either case.
 pub fn construct_groebner<T, E>(
     module_spec: T,
     kind: Option<algebra::SteenrodKind>,
@@ -234,7 +235,14 @@ where
     };
     let algebra = Arc::new(algebra);
     let module = Arc::new(FDModule::from_json(Arc::clone(&algebra), &json)?);
-    crate::groebner::Resolution::new(module)
+    let resolution = crate::groebner::Resolution::new(module)?;
+    match std::env::var("GROEBNER_X2M").as_deref() {
+        Ok("audit") => resolution.set_x2m(Some(::groebner::FilterMode::Audit)),
+        Ok("enforce") => resolution.set_x2m(Some(::groebner::FilterMode::Enforce)),
+        Ok(other) => return Err(anyhow!("unknown GROEBNER_X2M {other}")),
+        Err(_) => {}
+    }
+    Ok(resolution)
 }
 
 /// See [`construct`]

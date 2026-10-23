@@ -13,6 +13,52 @@ use ext::{
 use rstest::rstest;
 use sseq::coordinates::Bidegree;
 
+/// Lin's x2m pruning, in force, does not change the result.
+#[rstest]
+#[trace]
+#[case("S_2", 40, 20)]
+#[case("C2", 30, 15)]
+#[case("Joker", 30, 15)]
+#[case("Z", 30, 10)]
+#[case("S_3", 80, 12)]
+#[case("C3v1", 60, 10)]
+#[case("S_5", 150, 6)]
+#[case("C5v1", 120, 6)]
+fn compare_x2m(#[case] module_name: &str, #[case] n: i32, #[case] s: i32) {
+    let max = Bidegree::n_s(n, s);
+    let a = construct_standard::<false, _, _>(module_name, None).unwrap();
+    let b = construct_groebner(module_name, None).unwrap();
+    b.set_x2m(Some(groebner::FilterMode::Enforce));
+
+    a.compute_through_stem(max);
+    b.compute_through_stem(max);
+
+    assert_eq!(a.graded_dimension_string(), b.graded_dimension_string());
+    let report = b.filter_report().unwrap();
+    let discarded: u64 = report.filters[0].2.values().map(|c| c.discarded).sum();
+    assert!(discarded > 0);
+}
+
+/// Every pair Lin's x2m criterion discards is redundant.
+#[rstest]
+#[trace]
+#[case("S_2", 40, 20)]
+#[case("Joker", 30, 15)]
+#[case("S_3", 80, 12)]
+#[case("C5v1", 120, 6)]
+fn audit_x2m(#[case] module_name: &str, #[case] n: i32, #[case] s: i32) {
+    let b = construct_groebner(module_name, None).unwrap();
+    b.set_x2m(Some(groebner::FilterMode::Audit));
+    b.compute_through_stem(Bidegree::n_s(n, s));
+    let report = b.filter_report().unwrap();
+    let (correct, wrong) = report.filters[0]
+        .2
+        .values()
+        .fold((0, 0), |(c, w), x| (c + x.correct, w + x.wrong));
+    assert!(correct > 0);
+    assert_eq!(wrong, 0);
+}
+
 #[rstest]
 #[trace]
 #[case("S_2", 30, 15)]

@@ -208,6 +208,24 @@ impl Params {
         Poly::from_terms(terms, p)
     }
 
+    /// The product `c * m * x` in the associated graded algebra of the May filtration: the terms
+    /// of the product whose May filtration is the sum of those of the factors.
+    pub fn mul_may_poly(&self, m: Mono, c: u32, x: &Poly) -> Poly {
+        let p = self.prime();
+        let wm = self.may_filtration(m);
+        let mut terms = Vec::with_capacity(x.num_terms());
+        for &(t, d) in x.terms() {
+            let cd = c * d % p;
+            let w = wm + self.may_filtration(t.mono);
+            self.mul_cached(m, t.mono, |prod, e| {
+                if self.may_filtration(prod) == w {
+                    terms.push((ModMono::new(t.generator, prod), cd * e % p));
+                }
+            });
+        }
+        Poly::from_terms(terms, p)
+    }
+
     /// Format a module element, naming generator `g` by `name(g)`.
     pub fn format_poly(&self, x: &Poly, name: impl Fn(u32) -> String) -> String {
         if x.is_zero() {

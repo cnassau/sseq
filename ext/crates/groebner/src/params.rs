@@ -29,10 +29,11 @@ pub struct Position {
 
 /// The prime, kind and monomial encoding of a Steenrod algebra.
 ///
-/// Monomials are ordered by May weight first, then by their digits read as one integer with the
-/// lowest-degree position most significant, then by their exterior part. The leading term of a
-/// polynomial is its *smallest* term. This is Lin's order at `p = 2`, and makes the leading term of
-/// a product the product of the leading terms in the associated graded algebra
+/// Monomials are ordered by May weight first, then by their exterior part with $Q_0$ most
+/// significant, then by their digits read as one integer with the lowest-degree position most
+/// significant, as [`Mono`] lays them out. The leading term of a polynomial is its *smallest* term.
+/// This is Lin's order at `p = 2`, and makes the leading term of a product the product of the
+/// leading terms in the associated graded algebra
 /// $E[Q_0, Q_1, \dots] \otimes \bigotimes_{i,n} \mathbb{F}_p[x_{i,n}]/(x_{i,n}^p)$ whenever that
 /// is non-zero.
 #[derive(Debug)]

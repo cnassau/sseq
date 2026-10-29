@@ -48,6 +48,12 @@ basis. It needs a resolution of the ground field.
 other tools print, so their output can be fed back in. Cycles of one bidegree are lifted together;
 a cycle without a lift gets the reason (`d(z) != 0`, or nonzero under the augmentation in `C_0`).
 
+`sseq_steenrod_module` builds any module known to sseq in Sage, as a `SseqSteenrodModule`: a graded
+vector space over `F_p` with the action of every Milnor basis element through a degree `t_max`, so
+that `a * x` works for `a` in `M.algebra()`. Finite modules come whole; infinite ones are truncated
+at `t_max`. Specs that are the cofiber of a map (`C4`, `C9`, ...) are chain complexes rather than
+modules and are refused.
+
 The Sage side lives in [`sage/sseq.sage`](sage/sseq.sage) and is compiled into the server. Because
 of the sandbox it uses no imports, no dunder names and none of Sage's persistence functions; keep
 it that way when editing it.

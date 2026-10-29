@@ -7,7 +7,9 @@ use algebra::{
     milnor_algebra::{MilnorBasisElement, MilnorProfile, PPartEntry},
     module::{FreeModule, Module},
 };
-use ext::chain_complex::{ChainComplex, FreeChainComplex};
+use ext::chain_complex::{
+    AugmentedChainComplex, BoundedChainComplex, ChainComplex, FreeChainComplex,
+};
 use sseq::coordinates::Bidegree;
 
 use crate::Res;
@@ -141,6 +143,97 @@ fn write_terms(
     }
 }
 
+/// Sage code assigning to `var` the module `res` resolves, as a `SseqSteenrodModule` holding the
+/// action of every Milnor basis element on every basis element through degree `t_max`.
+///
+/// `t_max` defaults to the top degree of a finite module and is capped by it; an infinite module
+/// needs one.
+pub fn sage_steenrod_module(
+    res: &Res,
+    name: &str,
+    var: &str,
+    t_max: Option<i32>,
+) -> anyhow::Result<String> {
+    let target = res.target();
+    anyhow::ensure!(
+        target.max_s() == 1,
+        "{name} is the cofiber of a map, a two-term chain complex rather than a single module"
+    );
+    let module = target.module(0);
+    let algebra = res.algebra();
+    let milnor: &MilnorAlgebra = (&*algebra).try_into()?;
+    let generic = milnor.prime() != 2;
+    let min = module.min_degree();
+    let top = module.max_degree();
+    let t_max = match (t_max, top) {
+        (Some(t), Some(top)) => t.min(top),
+        (Some(t), None) => t,
+        (None, Some(top)) => top,
+        (None, None) => anyhow::bail!("{name} is infinite, so give t_max"),
+    };
+    anyhow::ensure!(
+        t_max >= min && t_max - min <= MAX_MODULE_RANGE,
+        "t_max must lie between the bottom degree {min} and {}",
+        min + MAX_MODULE_RANGE
+    );
+    let complete = top.is_some_and(|top| t_max >= top);
+    module.compute_basis(t_max);
+    algebra.compute_basis(t_max - min);
+
+    let mut names = String::new();
+    let mut actions = String::new();
+    for t in min..=t_max {
+        for i in 0..module.dimension(t) {
+            let basis_name = python_str(&module.basis_element_to_string(t, i));
+            write!(names, "({t}, {i}): {basis_name}, ").unwrap();
+            for d in 1..=t_max - t {
+                for op in 0..algebra.dimension(d) {
+                    let mut result =
+                        fp::vector::FpVector::new(milnor.prime(), module.dimension(t + d));
+                    module.act_on_basis(result.as_slice_mut(), 1, d, op, t, i);
+                    if result.is_zero() {
+                        continue;
+                    }
+                    let key = milnor_key(&milnor.basis_element_from_index(d, op), generic);
+                    write!(actions, "({key}, ({t}, {i})): [").unwrap();
+                    for (j, c) in result.iter_nonzero() {
+                        write!(actions, "({c}, ({}, {j})), ", t + d).unwrap();
+                    }
+                    actions.push_str("], ");
+                }
+            }
+        }
+    }
+    let complete = if complete { "True" } else { "False" };
+    Ok(format!(
+        "{var} = sseq_steenrod_module({name}, {p}, {algebra}, {{{names}}}, {t_max}, {complete}, \
+         {{{actions}}})",
+        name = python_str(name),
+        p = milnor.prime(),
+        algebra = sage_algebra(milnor)?,
+    ))
+}
+
+/// Largest range of degrees a `SseqSteenrodModule` covers. The action table grows with the number
+/// of Milnor basis elements across the range, so this keeps replies to a size worth relaying.
+const MAX_MODULE_RANGE: i32 = 64;
+
+/// A Python string literal for `s`.
+fn python_str(s: &str) -> String {
+    let mut out = String::from("'");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            c if c.is_ascii_graphic() || c == ' ' => out.push(c),
+            c if (c as u32) < 0x10000 => write!(out, "\\u{:04x}", c as u32).unwrap(),
+            c => write!(out, "\\U{:08x}", c as u32).unwrap(),
+        }
+    }
+    out.push('\'');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +306,59 @@ mod tests {
             algebra("ko"),
             "SteenrodAlgebra(2, basis='milnor', profile=(2, 1), truncation_type=0)"
         );
+    }
+
+    #[test]
+    fn python_strings() {
+        assert_eq!(python_str("x0"), "'x0'");
+        assert_eq!(python_str("a'b\\"), "'a\\'b\\\\'");
+        assert_eq!(python_str("\u{3b1}\n"), "'\\u03b1\\u000a'");
+    }
+
+    /// The module of a resolution, by name.
+    fn module(name: &str, t_max: Option<i32>) -> anyhow::Result<String> {
+        let res = ext::utils::construct((name, "milnor"), None).unwrap();
+        sage_steenrod_module(&res, name, "M", t_max)
+    }
+
+    #[test]
+    fn steenrod_modules() {
+        // Ceta: cells in degrees 0 and 2 joined by Sq(2).
+        let ceta = module("Ceta", None).unwrap();
+        assert!(
+            ceta.contains(", 2, True, {((2,), (0, 0)): [(1, (2, 0)), ], })"),
+            "{ceta}"
+        );
+        // Calpha at p = 3: P(1) joins the cells in degrees 0 and 4.
+        let calpha = module("Calpha", None).unwrap();
+        assert!(
+            calpha.contains("(((), (1,)), (0, 0)): [(1, (4, 0)), ]"),
+            "{calpha}"
+        );
+        // Infinite modules need t_max and are marked incomplete.
+        assert!(module("RP_inf", None).is_err());
+        assert!(module("RP_inf", Some(8)).unwrap().contains(", 8, False, {"));
+        // A cofiber is not a single module.
+        assert!(module("C2v14", None).is_err());
+    }
+
+    /// Every built-in module either builds or is refused with an error, never a panic.
+    #[test]
+    fn every_module() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../ext/steenrod_modules");
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+            // Building the p = 7 algebra overflows an i32 in MilnorAlgebra's exterior basis
+            // generation, which panics in debug builds.
+            if name == "S_7" {
+                continue;
+            }
+            let result = module(&name, Some(16));
+            let json: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let cofiber = !json["cofiber"].is_null();
+            assert_eq!(result.is_err(), cofiber, "{name}: {result:?}");
+        }
     }
 }

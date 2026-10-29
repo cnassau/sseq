@@ -245,6 +245,123 @@ class SseqResolution(SageObject):
         ]
 
 
+class SseqSteenrodModule(CombinatorialFreeModule):
+    """
+    A module over a Steenrod algebra, as a graded `F_p`-vector space with an action table.
+
+    The basis keys are pairs `(t, i)`, the `i`-th basis element in degree `t`. The table holds the
+    action of every Milnor basis element on every basis element through degree `t_max`. When the
+    module is complete (finite, with `t_max` its top degree) everything above is zero; otherwise
+    acting beyond `t_max` raises `SseqMissingData`.
+
+    `a * x` works for `a` in `self.algebra()`; `self.act(a, x)` also accepts any element that
+    converts into it.
+    """
+
+    def setup(self, name, algebra, names, t_max, complete, actions):
+        """Record the action table; use `sseq_steenrod_module` instead of calling this."""
+        self._name = name
+        self._A = algebra
+        self._names = names
+        self._t_max = t_max
+        self._complete = complete
+        # (milnor_key, (t, i)) -> terms (coefficient, (t', j)); absent means zero.
+        self._actions = actions
+
+    def _repr_(self):
+        truncated = "" if self._complete else ", truncated above degree %s" % self._t_max
+        return "Steenrod module %s over %s%s" % (self._name, self._A, truncated)
+
+    def _repr_term(self, key):
+        return self._names[key]
+
+    def degree_on_basis(self, key):
+        """The degree `t` of the basis element `(t, i)`."""
+        return key[0]
+
+    def algebra(self):
+        """The Steenrod algebra (or sub-Hopf-algebra) acting on the module."""
+        return self._A
+
+    def t_max(self):
+        """The largest degree the action table covers."""
+        return self._t_max
+
+    def is_complete(self):
+        """Whether the module is all there, rather than truncated at `t_max`."""
+        return self._complete
+
+    def act(self, a, x):
+        """The action `a * x`, for `a` anything that converts into `self.algebra()`."""
+        A = self._A
+        try:
+            a = A(a)
+        except (TypeError, ValueError):
+            raise ValueError("%s is not in %s" % (a, A))
+        terms = []
+        for key, c in x:
+            for m, k in a.monomial_coefficients().items():
+                d = A.monomial(m).degree()
+                if d == 0:
+                    terms.append((key, c * k))
+                    continue
+                if key[0] + d > self._t_max:
+                    if self._complete:
+                        continue
+                    raise SseqMissingData(
+                        "%s is truncated above degree %s; call the sseq MCP tool "
+                        "sseq_steenrod_module with module=%r and a larger t_max"
+                        % (self._name, self._t_max, self._name)
+                    )
+                for coeff, target in self._actions.get((m, key), []):
+                    terms.append((target, c * k * coeff))
+        return self.sum_of_terms(terms)
+
+    def check_associativity(self):
+        """
+        The triples `(a, b, x)` of Milnor basis elements and basis elements with
+        `(a * b) * x != a * (b * x)` inside the table's range; empty if the action is associative.
+        """
+        A = self._A
+        failures = []
+        for key in self.basis().keys():
+            x = self.monomial(key)
+            room = self._t_max - key[0]
+            for db in range(1, room + 1):
+                for b in A.basis(db):
+                    bx = self.act(b, x)
+                    for da in range(1, room - db + 1):
+                        for a in A.basis(da):
+                            if self.act(a * b, x) != self.act(a, bx):
+                                failures.append((a, b, x))
+        return failures
+
+    class Element(CombinatorialFreeModule.Element):
+        """An element of a `SseqSteenrodModule`, acted on by the module's Steenrod algebra."""
+
+        def _acted_upon_(self, scalar, self_on_left):
+            P = self.parent()
+            if not self_on_left and scalar.parent() is P.algebra():
+                return P.act(scalar, self)
+            return CombinatorialFreeModule.Element._acted_upon_(self, scalar, self_on_left)
+
+
+def sseq_steenrod_module(name, p, algebra, names, t_max, complete, actions):
+    """A module known to sseq; the `sseq_steenrod_module` tool returns the call to make."""
+    # The prefix keeps modules with the same basis keys apart, since Sage reuses equal parents.
+    M = SseqSteenrodModule(
+        GF(p),
+        tuple(sorted(names)),
+        prefix=name,
+        category=ModulesWithBasis(GF(p)).Graded(),
+    )
+    M.setup(name, algebra, names, t_max, complete, actions)
+    # Sage looks for an action on the first product of an algebra element with a module element and
+    # remembers a failure, so make that first product one that cannot raise.
+    algebra.one() * M.monomial(min(names))
+    return M
+
+
 def sseq_resolution(rid, p, algebra):
     """A resolution with no data yet; the `sseq_resolve` tool returns the call to make."""
     R = SseqResolution()

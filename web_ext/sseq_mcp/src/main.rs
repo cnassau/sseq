@@ -68,7 +68,9 @@ In Sage, with R the resolution: R.ngens(s, t), R.gen(s, t, i), R.C(s), R.d(s), R
      R.ngens(s, t) since the resolution is minimal. Generator counts are also available without \
      Sage from sseq_resolve, and products (the lines of an Adams chart, or products by any class \
      over the ground field) from sseq_products, and the chain maps realising products by a class \
-     from sseq_chain_map. sseq_lift solves d(y) = z for any number of cycles z at once.";
+     from sseq_chain_map. sseq_lift solves d(y) = z for any number of cycles z at once. \
+     sseq_steenrod_module builds the module itself in Sage, with the Steenrod algebra acting on \
+     it.";
 
 #[derive(Parser)]
 struct Args {
@@ -205,6 +207,22 @@ struct LiftRequest {
     /// e.g. "Sq(2) x_1,2 + Sq(3) x_1,1" (p = 2) or "2 Q_0 P(1) x_1,4" (odd p). They may lie in
     /// different bidegrees.
     cycles: Vec<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SteenrodModuleRequest {
+    /// A built-in module (see sseq_list_modules), optionally shifted, e.g. "Ceta", "ko", "C2[1]".
+    module: String,
+    /// Largest degree to include. Defaults to the top degree of a finite module, which gives the
+    /// whole module; required for infinite ones such as RP_inf, which are then truncated.
+    t_max: Option<i32>,
+    /// Name of the Sage variable to assign the module to.
+    #[serde(default = "default_module_var")]
+    var: String,
+}
+
+fn default_module_var() -> String {
+    "M".to_string()
 }
 
 fn default_var() -> String {
@@ -404,6 +422,39 @@ impl SseqServer {
                 );
             }
             Ok(out)
+        })
+        .await
+    }
+
+    #[tool(description = "Sage code constructing a module known to sseq (any of \
+                          sseq_list_modules) as a SseqSteenrodModule: a graded vector space over \
+                          F_p on which the module's Steenrod algebra acts, so that `a * x` works \
+                          for a in M.algebra(). Finite modules come whole; infinite ones \
+                          (RP_inf, j, ...) are truncated at t_max, and acting beyond it raises \
+                          SseqMissingData. Run sseq_sage_module first, then the returned code \
+                          with mcp-sage evaluate_sage.")]
+    async fn sseq_steenrod_module(
+        &self,
+        Parameters(req): Parameters<SteenrodModuleRequest>,
+    ) -> Result<String, ErrorData> {
+        if !is_identifier(&req.var) {
+            return Err(ErrorData::invalid_params(
+                "var must be a Python identifier",
+                None,
+            ));
+        }
+        let state = Arc::clone(&self.state);
+        blocking(move || {
+            let entry = state.get_or_construct(&req.module)?;
+            let code = encode::sage_steenrod_module(&entry.res, &req.module, &req.var, req.t_max)?;
+            if code.len() > MAX_DATA_LEN {
+                anyhow::bail!(
+                    "the module is {} bytes, over the {MAX_DATA_LEN} byte limit; give a smaller \
+                     t_max",
+                    code.len()
+                );
+            }
+            Ok(code)
         })
         .await
     }

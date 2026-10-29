@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use algebra::{Algebra, MilnorAlgebra, module::Module};
+use algebra::{Algebra, module::Module};
 use ext::{
     chain_complex::{AugmentedChainComplex, BoundedChainComplex, ChainComplex, FreeChainComplex},
     ext_algebra::ExtAlgebra,
@@ -10,7 +10,7 @@ use ext::{
 use fp::vector::FpVector;
 use sseq::coordinates::{Bidegree, BidegreeElement};
 
-use crate::Res;
+use crate::{Res, elements::element_string};
 
 /// What to multiply by.
 pub enum Multiplier {
@@ -255,60 +255,12 @@ pub fn chain_map_table(
                 "{} {} {} : {value}",
                 b.n(),
                 b.s(),
-                generator_name(res, b.s(), b.t(), i)
+                crate::elements::generator_name(res, b.s(), b.t(), i)
             )
             .unwrap();
         }
     }
     out
-}
-
-/// The name `x_s,t`, or `x_s,t[i]` when `C_s` has several generators in degree `t`.
-fn generator_name(res: &Res, s: i32, t: i32, i: usize) -> String {
-    if res.number_of_gens_in_bidegree(Bidegree::s_t(s, t)) > 1 {
-        format!("x_{s},{t}[{i}]")
-    } else {
-        format!("x_{s},{t}")
-    }
-}
-
-/// `v`, an element of `C_s` in internal degree `t`, as a sum of Milnor basis elements times
-/// generators: `Sq(r_1, r_2, ...)` at p = 2, `Q_i ... P(r_1, ...)` with coefficients otherwise.
-fn element_string(res: &Res, s: i32, t: i32, v: &fp::vector::FpVector) -> String {
-    let algebra = res.algebra();
-    let algebra: &MilnorAlgebra = (&*algebra)
-        .try_into()
-        .expect("resolutions use the Milnor basis");
-    let generic = algebra.prime() != 2;
-    let module = res.module(s);
-    let terms: Vec<String> = v
-        .iter_nonzero()
-        .map(|(index, c)| {
-            let opgen = module.index_to_op_gen(t, index);
-            let elt =
-                algebra.basis_element_from_index(opgen.operation_degree, opgen.operation_index);
-            let op = if elt.degree == 0 {
-                "1".to_string()
-            } else if generic {
-                elt.to_string()
-            } else {
-                let r: Vec<String> = elt.p_part.iter().map(|r| r.to_string()).collect();
-                format!("Sq({})", r.join(","))
-            };
-            let c = if c == 1 {
-                String::new()
-            } else {
-                format!("{c} ")
-            };
-            let g = generator_name(res, s, opgen.generator_degree, opgen.generator_index);
-            format!("{c}{op} {g}")
-        })
-        .collect();
-    if terms.is_empty() {
-        "0".to_string()
-    } else {
-        terms.join(" + ")
-    }
 }
 
 #[cfg(test)]

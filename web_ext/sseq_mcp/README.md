@@ -1,10 +1,12 @@
 # sseq_mcp
 
 An [MCP](https://modelcontextprotocol.io) server that computes minimal resolutions over the
-Steenrod algebra and hands them to a SageMath session running in a separate mcp-sage server. In Sage a resolution is an `SseqResolution`: a family of
-`CombinatorialFreeModule`s `C_s` over Sage's `SteenrodAlgebra` (or a sub-Hopf-algebra given by a
-profile, such as A(1)), with the minimal generators as basis and algebra-linear differentials
-`d(s): C_s -> C_{s-1}`.
+Steenrod algebra and hands them to a SageMath session running in a separate mcp-sage server. In
+Sage a resolution is an `SseqResolution`: a family of graded free modules `C_s` over Sage's
+`SteenrodAlgebra` (or a sub-Hopf-algebra given by a profile, such as A(1)), with the minimal
+generators as basis and algebra-linear differentials `d(s): C_s -> C_{s-1}` preserving degrees.
+An element `a * x[(t, i)]` has degree `deg(a) + t`, which `degree()`, `homogeneous_component(n)`
+and the other graded-module methods take into account.
 
 ## Running
 
@@ -41,6 +43,10 @@ Products are determined up to sign.
 `sseq_chain_map` shows the chain level behind a product: the chain map `C_s -> C_(s - s0)` lifting
 a class of filtration `s0`, evaluated on every generator in a range, with values in the Milnor
 basis. It needs a resolution of the ground field.
+
+`sseq_lift` solves lifting problems `d(y) = z` for a list of cycles `z`, written in the notation the
+other tools print, so their output can be fed back in. Cycles of one bidegree are lifted together;
+a cycle without a lift gets the reason (`d(z) != 0`, or nonzero under the augmentation in `C_0`).
 
 The Sage side lives in [`sage/sseq.sage`](sage/sseq.sage) and is compiled into the server. Because
 of the sandbox it uses no imports, no dunder names and none of Sage's persistence functions; keep

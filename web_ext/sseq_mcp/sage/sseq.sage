@@ -19,13 +19,87 @@ class SseqMissingData(ValueError):
 SSEQ_KEYS = cartesian_product([NonNegativeIntegers(), NonNegativeIntegers()])
 
 
+class SseqFreeModule(CombinatorialFreeModule):
+    """
+    A free graded module over a Steenrod algebra on generators `x[(t, i)]` of degree `t`.
+
+    The degree of `a * x[(t, i)]` is `deg(a) + t`. Sage's graded modules with basis take the
+    degree of an element from its basis keys alone, as if the coefficients had degree zero, so the
+    element methods that depend on degrees are redefined here to count the coefficients' degrees.
+    """
+
+    def degree_on_basis(self, key):
+        """The degree `t` of the generator `x[(t, i)]`."""
+        return key[0]
+
+    def basis(self, d=None):
+        """
+        The basis of generators; `basis(d)` is not available.
+
+        The keys run over all pairs `(t, i)`, so the generators of one degree cannot be found by
+        searching them; `SseqResolution.gens(s, t)` lists them from the resolution's data.
+        """
+        if d is not None:
+            raise NotImplementedError(
+                "use R.gens(s, t) for the generators of C_s in degree t, or R.degree_basis(s, t) "
+                "for a basis of the degree t part over the ground field"
+            )
+        return CombinatorialFreeModule.basis(self)
+
+    class Element(CombinatorialFreeModule.Element):
+        """An element of a `SseqFreeModule`, graded by `deg(a) + t` on `a * x[(t, i)]`."""
+
+        def homogeneous_components(self):
+            """A dict from degrees to the nonzero homogeneous components of this element."""
+            P = self.parent()
+            A = P.base_ring()
+            terms = {}
+            for key, c in self:
+                for m, k in c.monomial_coefficients().items():
+                    a = k * A.monomial(m)
+                    terms.setdefault(a.degree() + key[0], []).append((key, a))
+            return {d: P.sum_of_terms(ts) for d, ts in terms.items()}
+
+        def is_homogeneous(self):
+            """Whether this element lies in a single degree; zero does."""
+            return len(self.homogeneous_components()) <= 1
+
+        def degree(self):
+            """The degree of this element, which must be homogeneous and nonzero."""
+            components = self.homogeneous_components()
+            if not components:
+                raise ValueError("the zero element does not have a well-defined degree")
+            if len(components) > 1:
+                raise ValueError("element is not homogeneous")
+            return next(iter(components))
+
+        homogeneous_degree = degree
+
+        def maximal_degree(self):
+            """The largest degree of a homogeneous component of this nonzero element."""
+            components = self.homogeneous_components()
+            if not components:
+                raise ValueError("the zero element does not have a well-defined degree")
+            return max(components)
+
+        def homogeneous_component(self, n):
+            """The degree `n` part of this element."""
+            return self.homogeneous_components().get(n, self.parent().zero())
+
+        def truncate(self, n):
+            """The sum of the homogeneous components of degree less than `n`."""
+            components = self.homogeneous_components()
+            return self.parent().sum(c for d, c in components.items() if d < n)
+
+
 class SseqResolution(SageObject):
     """
     A minimal free resolution `... -> C_2 -> C_1 -> C_0` of a module over a Steenrod algebra.
 
-    Each `C_s` is a `CombinatorialFreeModule` over `self.algebra()` whose basis is the set of minimal
-    generators. Generators and differentials become known as data is added with `add_data`; asking
-    about anything else raises `SseqMissingData`.
+    Each `C_s` is a graded free module over `self.algebra()` (a `SseqFreeModule`) whose basis is the
+    set of minimal generators, and the differentials preserve degrees. Generators and differentials
+    become known as data is added with `add_data`; asking about anything else raises
+    `SseqMissingData`.
     """
 
     def setup(self, rid, p, algebra):
@@ -95,9 +169,14 @@ class SseqResolution(SageObject):
         return self._ngens.get((s, t), 0)
 
     def C(self, s):
-        """The free module `C_s`, with basis keys `(t, i)`."""
+        """The graded free module `C_s`, with basis keys `(t, i)` of degree `t`."""
         if s not in self._C:
-            self._C[s] = CombinatorialFreeModule(self._A, SSEQ_KEYS, prefix="x%s" % s)
+            self._C[s] = SseqFreeModule(
+                self._A,
+                SSEQ_KEYS,
+                prefix="x%s" % s,
+                category=ModulesWithBasis(self._A).Graded(),
+            )
         return self._C[s]
 
     def gen(self, s, t, i):
@@ -111,7 +190,7 @@ class SseqResolution(SageObject):
         return [self.gen(s, t, i) for i in range(self.ngens(s, t))]
 
     def d(self, s):
-        """The differential `C_s -> C_{s-1}`, an algebra-linear morphism."""
+        """The differential `C_s -> C_{s-1}`, an algebra-linear map preserving degrees."""
         if s not in self._d:
             A = self._A
             target = self.C(s - 1)

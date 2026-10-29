@@ -1,5 +1,6 @@
 //! An MCP server that hands minimal resolutions over the Steenrod algebra to a SageMath session.
 
+mod elements;
 mod encode;
 mod products;
 
@@ -52,9 +53,9 @@ This server is the go-to point for Ext over the Steenrod algebra: minimal resolu
      Adams E_2 pages or minimal resolutions rather than computing these by hand or in plain Sage.
 
 The resolutions are meant to be studied in a SageMath session of the mcp-sage server, as a family \
-     of CombinatorialFreeModules C_s over Sage's SteenrodAlgebra with algebra-linear \
-     differentials d(s): C_s -> C_{s-1}. Sage code cannot reach this server, so you relay the \
-     data:
+     of graded free modules C_s over Sage's SteenrodAlgebra with algebra-linear, \
+     degree-preserving differentials d(s): C_s -> C_{s-1}. Sage code cannot reach this server, so \
+     you relay the data:
 
 1. mcp-sage start_sage_session; pass its workspace_token as `session` on every later call.
 2. sseq_sage_module, then run the returned code with mcp-sage evaluate_sage (once per workspace).
@@ -67,7 +68,7 @@ In Sage, with R the resolution: R.ngens(s, t), R.gen(s, t, i), R.C(s), R.d(s), R
      R.ngens(s, t) since the resolution is minimal. Generator counts are also available without \
      Sage from sseq_resolve, and products (the lines of an Adams chart, or products by any class \
      over the ground field) from sseq_products, and the chain maps realising products by a class \
-     from sseq_chain_map.";
+     from sseq_chain_map. sseq_lift solves d(y) = z for any number of cycles z at once.";
 
 #[derive(Parser)]
 struct Args {
@@ -194,6 +195,16 @@ struct ChainMapRequest {
     max_n: i32,
     /// Largest filtration of the generators to evaluate the map on.
     max_s: i32,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct LiftRequest {
+    /// The resolution id returned by sseq_resolve.
+    id: String,
+    /// The cycles z to lift, each an element of some C_s written as the other tools print them,
+    /// e.g. "Sq(2) x_1,2 + Sq(3) x_1,1" (p = 2) or "2 Q_0 P(1) x_1,4" (odd p). They may lie in
+    /// different bidegrees.
+    cycles: Vec<String>,
 }
 
 fn default_var() -> String {
@@ -389,6 +400,72 @@ impl SseqServer {
                 anyhow::bail!(
                     "the products are {} bytes, over the {MAX_DATA_LEN} byte limit; ask for a \
                      smaller range",
+                    out.len()
+                );
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Solve lifting problems in the minimal resolution: for each cycle z in C_s \
+                       find y in C_(s+1) with d(y) = z. Takes any number of cycles, in any \
+                       bidegrees, and lifts those of one bidegree together. Returns one line per \
+                       cycle, `z_k (s, t): y` with y in the notation the cycles are written in, \
+                       or the reason z has no lift (not a cycle, with d(z); or, in C_0, nonzero \
+                       under the augmentation). Computes further first if needed."
+    )]
+    async fn sseq_lift(
+        &self,
+        Parameters(req): Parameters<LiftRequest>,
+    ) -> Result<String, ErrorData> {
+        let entry = self.state.get(&req.id)?;
+        blocking(move || {
+            let res = &entry.res;
+            let parsed: Vec<elements::Element> = req
+                .cycles
+                .iter()
+                .enumerate()
+                .map(|(k, z)| {
+                    elements::parse(res, z).map_err(|e| anyhow::anyhow!("cycle z_{k}: {e:#}"))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            {
+                let _guard = entry.compute.lock().unwrap();
+                for z in &parsed {
+                    anyhow::ensure!(
+                        z.s >= 0 && z.t <= algebra::milnor_algebra::PPart::MAX_DEGREE,
+                        "cycles must lie in C_s with s >= 0 and t <= {}",
+                        algebra::milnor_algebra::PPart::MAX_DEGREE
+                    );
+                    res.compute_through_bidegree(Bidegree::s_t(z.s + 1, z.t));
+                }
+            }
+            let cycles: Vec<(i32, i32, fp::vector::FpVector)> = parsed
+                .iter()
+                .enumerate()
+                .map(|(k, z)| {
+                    let v = z
+                        .vector(res)
+                        .map_err(|e| anyhow::anyhow!("cycle z_{k}: {e:#}"))?;
+                    Ok((z.s, z.t, v))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            let mut out = String::new();
+            for (k, ((s, t, _), lift)) in
+                cycles.iter().zip(elements::lift(res, &cycles)).enumerate()
+            {
+                let value = match lift {
+                    Ok(y) => elements::element_string(res, s + 1, *t, &y),
+                    Err(reason) => reason,
+                };
+                writeln!(out, "z_{k} ({s}, {t}): {value}").unwrap();
+            }
+            if out.len() > MAX_DATA_LEN {
+                anyhow::bail!(
+                    "the lifts are {} bytes, over the {MAX_DATA_LEN} byte limit; lift fewer \
+                     cycles at a time",
                     out.len()
                 );
             }

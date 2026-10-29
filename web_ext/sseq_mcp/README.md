@@ -32,6 +32,16 @@ Asking `R` about a bidegree it has no data for raises `SseqMissingData`, whose m
 `sseq_resolution_data` call to make. `sseq_list_modules` lists the modules in
 `ext/steenrod_modules`.
 
+`sseq_products` gives the multiplicative structure without going through Sage: the products of a
+class with every generator in a range, as `n s i -> n' s' : coordinates` lines. The class is a
+named filtration-one class (`h_0`, `h_1`, ... at p = 2, `a_0`, `h_0` at odd primes), read off the
+differentials, or, for a resolution of the ground field, any class of Ext, through chain maps.
+Products are determined up to sign.
+
+`sseq_chain_map` shows the chain level behind a product: the chain map `C_s -> C_(s - s0)` lifting
+a class of filtration `s0`, evaluated on every generator in a range, with values in the Milnor
+basis. It needs a resolution of the ground field.
+
 The Sage side lives in [`sage/sseq.sage`](sage/sseq.sage) and is compiled into the server. Because
 of the sandbox it uses no imports, no dunder names and none of Sage's persistence functions; keep
 it that way when editing it.

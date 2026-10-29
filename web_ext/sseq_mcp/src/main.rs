@@ -1,6 +1,7 @@
 //! An MCP server that hands minimal resolutions over the Steenrod algebra to a SageMath session.
 
 mod encode;
+mod products;
 
 use std::{
     collections::HashMap,
@@ -64,7 +65,9 @@ The resolutions are meant to be studied in a SageMath session of the mcp-sage se
 In Sage, with R the resolution: R.ngens(s, t), R.gen(s, t, i), R.C(s), R.d(s), R.ext_dims(s_max, \
      t_max), R.degree_basis(s, t), R.check_d_squared(s_max, t_max). Ext^{s,t} has dimension \
      R.ngens(s, t) since the resolution is minimal. Generator counts are also available without \
-     Sage from sseq_resolve.";
+     Sage from sseq_resolve, and products (the lines of an Adams chart, or products by any class \
+     over the ground field) from sseq_products, and the chain maps realising products by a class \
+     from sseq_chain_map.";
 
 #[derive(Parser)]
 struct Args {
@@ -76,9 +79,12 @@ struct Args {
     save_dir: Option<PathBuf>,
 }
 
-/// A resolution and the lock its computations take.
+/// A resolution, the ring its products come from, and the lock its computations take.
 struct Entry {
     res: Arc<Res>,
+    /// `Ext(k, k)` on `res`; its products by arbitrary classes are only meaningful when `res`
+    /// resolves `k` (see [`products::is_unit`]).
+    ext: ext::ext_algebra::ExtAlgebra<Res>,
     /// Held while extending `res`, so that two requests do not compute the same bidegrees at once.
     compute: Mutex<()>,
 }
@@ -103,8 +109,10 @@ impl State {
         }
         let save_dir = self.save_dir.as_ref().map(|dir| dir.join(module));
         let res = ext::utils::construct((module, "milnor"), save_dir)?;
+        let res = Arc::new(res);
         let entry = Arc::new(Entry {
-            res: Arc::new(res),
+            ext: ext::ext_algebra::ExtAlgebra::new(Arc::clone(&res)),
+            res,
             compute: Mutex::new(()),
         });
         Ok(Arc::clone(
@@ -155,6 +163,37 @@ struct DataRequest {
     /// Name of the SseqResolution variable in the Sage workspace.
     #[serde(default = "default_var")]
     var: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ProductsRequest {
+    /// The resolution id returned by sseq_resolve.
+    id: String,
+    /// What to multiply by: a filtration-one class by name ("h_0", "h_1", "a_0", ...; sseq_resolve
+    /// lists them), or, for resolutions of the ground field, a class given as "n s i" (generator i
+    /// in stem n, filtration s) or as "n s" together with `coords`.
+    by: String,
+    /// Coordinates of the multiplier in the generator basis of its bidegree, when `by` is "n s".
+    coords: Option<Vec<u32>>,
+    /// Largest stem of the classes being multiplied.
+    max_n: i32,
+    /// Largest filtration of the classes being multiplied.
+    max_s: i32,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ChainMapRequest {
+    /// The resolution id returned by sseq_resolve; it must resolve the ground field.
+    id: String,
+    /// The class the chain map lifts: a filtration-one class by name ("h_0", ...), or "n s i"
+    /// (generator i in stem n, filtration s), or "n s" together with `coords`.
+    class: String,
+    /// Coordinates of the class in the generator basis of its bidegree, when `class` is "n s".
+    coords: Option<Vec<u32>>,
+    /// Largest stem of the generators to evaluate the map on.
+    max_n: i32,
+    /// Largest filtration of the generators to evaluate the map on.
+    max_s: i32,
 }
 
 fn default_var() -> String {
@@ -253,11 +292,22 @@ impl SseqServer {
             let res = &entry.res;
             let algebra = res.algebra();
             let algebra: &MilnorAlgebra = (&*algebra).try_into()?;
+            let names: Vec<String> = products::named(res)
+                .into_iter()
+                .map(|(name, ..)| name)
+                .collect();
             let mut out = format!(
-                "id: {id}\nSage: R = sseq_resolution({id:?}, {p}, {algebra})\n\nn s count\n",
+                "id: {id}\nSage: R = sseq_resolution({id:?}, {p}, {algebra})\nNamed products: \
+                 {names}{classes}\n\nn s count\n",
                 id = req.module,
                 p = algebra.prime(),
                 algebra = encode::sage_algebra(algebra)?,
+                names = names.join(", "),
+                classes = if products::is_unit(res) {
+                    "; products by any class are available too"
+                } else {
+                    ""
+                },
             );
             for b in res.iter_stem() {
                 let n = res.number_of_gens_in_bidegree(b);
@@ -309,6 +359,76 @@ impl SseqServer {
                 );
             }
             Ok(code)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Multiplicative structure of Ext: the products of a class with every \
+                       generator in stems <= max_n and filtrations <= max_s, as lines `n s i -> \
+                       n' s' : coordinates`. Use this for the h_0, h_1, h_2 (or a_0, h_0) lines \
+                       of an Adams chart, or for products by any class of Ext of the ground \
+                       field. Products are determined up to sign. Computes further first if \
+                       needed."
+    )]
+    async fn sseq_products(
+        &self,
+        Parameters(req): Parameters<ProductsRequest>,
+    ) -> Result<String, ErrorData> {
+        let entry = self.state.get(&req.id)?;
+        blocking(move || {
+            let res = &entry.res;
+            let x = products::parse(res, &req.by, req.coords.as_deref())?;
+            let shift = x.degree();
+            // Products are computed under the lock, since a class product extends chain maps
+            // over the whole computed resolution.
+            let _guard = entry.compute.lock().unwrap();
+            res.compute_through_stem(Bidegree::n_s(req.max_n + shift.n(), req.max_s + shift.s()));
+            let out = products::table(res, &entry.ext, &x, req.max_n, req.max_s)?;
+            if out.len() > MAX_DATA_LEN {
+                anyhow::bail!(
+                    "the products are {} bytes, over the {MAX_DATA_LEN} byte limit; ask for a \
+                     smaller range",
+                    out.len()
+                );
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "The chain map gamma: C_s -> C_(s - s0) of the minimal resolution that \
+                       lifts a class of Ext in filtration s0 (multiplication by that class at \
+                       chain level), evaluated on every generator in stems <= max_n and \
+                       filtrations <= max_s. Lines `n s generator : gamma(generator)`, the values \
+                       written in the Milnor basis. Only for resolutions of the ground field \
+                       (S_2, S_3, tmf2, ...). Computes further first if needed."
+    )]
+    async fn sseq_chain_map(
+        &self,
+        Parameters(req): Parameters<ChainMapRequest>,
+    ) -> Result<String, ErrorData> {
+        let entry = self.state.get(&req.id)?;
+        blocking(move || {
+            let res = &entry.res;
+            anyhow::ensure!(
+                products::is_unit(res),
+                "chain maps need a resolution of the ground field (such as S_2 or tmf2)"
+            );
+            // Chain maps are built under the lock, since they extend over the computed resolution.
+            let _guard = entry.compute.lock().unwrap();
+            res.compute_through_stem(Bidegree::n_s(req.max_n, req.max_s));
+            let x = products::parse(res, &req.class, req.coords.as_deref())?.to_class(res)?;
+            let out = products::chain_map_table(res, &entry.ext, &x, req.max_n, req.max_s);
+            if out.len() > MAX_DATA_LEN {
+                anyhow::bail!(
+                    "the table is {} bytes, over the {MAX_DATA_LEN} byte limit; ask for a smaller \
+                     range",
+                    out.len()
+                );
+            }
+            Ok(out)
         })
         .await
     }
